@@ -1,0 +1,320 @@
+000000000004e3f0 t polymarket_client_sdk::clob::types::ser_salt::{{closure}}
+000000000004e630 t polymarket_client_sdk::clob::types::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::OrderType>::deserialize
+000000000004e660 t polymarket_client_sdk::clob::types::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::OrderStatusType>::deserialize
+000000000004f110 t <polymarket_client_sdk::clob::types::TickSize as serde_core::de::Deserialize>::deserialize
+00000000000669c0 t polymarket_client_sdk::error::Error::validation
+0000000000066a40 t polymarket_client_sdk::error::Error::status
+0000000000066c90 t core::ptr::drop_in_place<arbitrage_bot::trading::client::TradingClient::cancel_orders::{{closure}}>
+0000000000067080 t core::ptr::drop_in_place<tokio::sync::mpsc::unbounded::UnboundedReceiver<arbitrage_bot::trading::client::FillEvent>>
+0000000000067100 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>
+00000000000672a0 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>
+0000000000067cf0 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>
+0000000000068d90 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>
+0000000000068f70 t core::ptr::drop_in_place<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}}>
+0000000000069de0 t core::ptr::drop_in_place<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}}>
+000000000006a4d0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::order_builder::OrderBuilder<polymarket_client_sdk::clob::order_builder::Limit,polymarket_client_sdk::auth::Normal>>
+000000000006a540 t core::ptr::drop_in_place<tokio::runtime::task::core::CoreStage<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>>
+000000000006a5c0 t core::ptr::drop_in_place<tokio::runtime::task::core::CoreStage<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>>
+000000000006a640 t core::ptr::drop_in_place<tokio::runtime::task::core::CoreStage<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}}>>
+000000000006a6c0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::post_orders::{{closure}}>
+000000000006a9e0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::order_builder::OrderBuilder<polymarket_client_sdk::clob::order_builder::Limit,polymarket_client_sdk::auth::Normal>::build::{{closure}}>
+000000000006af30 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::create_headers::{{closure}}>
+000000000006b260 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::sign<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>::{{closure}}>
+000000000006be20 t core::ptr::drop_in_place<arbitrage_bot::auth::ApiCredentials>
+000000000006be60 t core::ptr::drop_in_place<polymarket_client_sdk::error::Error>
+000000000006c6f0 t core::ptr::drop_in_place<arbitrage_bot::market::types::MarketAssets>
+000000000006cb90 t core::ptr::drop_in_place<arbitrage_bot::websocket::types::UserSubscribeMessage>
+000000000006cc50 t core::ptr::drop_in_place<arbitrage_bot::websocket::spread_capture_ws::PositionState>
+000000000006cd80 t core::ptr::drop_in_place<alloc::vec::Vec<arbitrage_bot::trading::client::FillEvent>>
+000000000006ce70 t core::ptr::drop_in_place<alloc::vec::Vec<polymarket_client_sdk::clob::types::SignedOrder>>
+000000000007fc20 t core::ptr::drop_in_place<tokio::sync::rwlock::RwLock<arbitrage_bot::market::types::MarketState>::read::{{closure}}>
+0000000000080070 t core::ptr::drop_in_place<tokio::sync::rwlock::RwLock<arbitrage_bot::market::types::MarketState>::read::{{closure}}::{{closure}}>
+0000000000080170 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::cancel_order::{{closure}}>
+00000000000803e0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::create_headers::{{closure}}>.3724
+0000000000080430 t polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<K>>::create_headers::{{closure}}
+0000000000081860 t core::ptr::drop_in_place<polymarket_client_sdk::request<polymarket_client_sdk::auth::Credentials>::{{closure}}>
+0000000000081aa0 t core::ptr::drop_in_place<polymarket_client_sdk::auth::l2::create_headers<polymarket_client_sdk::auth::Normal>::{{closure}}>
+0000000000082ff0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::server_time::{{closure}}>
+0000000000083050 t polymarket_client_sdk::request::{{closure}}
+0000000000084040 t core::ptr::drop_in_place<core::result::Result<polymarket_client_sdk::clob::types::response::CancelOrdersResponse,polymarket_client_sdk::error::Error>>
+00000000000840e0 t core::ptr::drop_in_place<core::option::Option<polymarket_client_sdk::clob::types::response::CancelOrdersResponse>>
+0000000000088e80 t core::ptr::drop_in_place<tokio::sync::mutex::Mutex<alloc::vec::Vec<arbitrage_bot::websocket::market_ws::PriceTick>>::lock::{{closure}}>
+0000000000089270 t core::ptr::drop_in_place<tokio::sync::mutex::Mutex<alloc::vec::Vec<arbitrage_bot::websocket::market_ws::PriceTick>>::acquire::{{closure}}>
+0000000000089370 t core::ptr::drop_in_place<tokio::sync::mutex::Mutex<alloc::vec::Vec<arbitrage_bot::websocket::market_ws::PriceTick>>::lock::{{closure}}::{{closure}}>
+0000000000089480 t core::ptr::drop_in_place<arbitrage_bot::config::Args>
+00000000000894e0 t core::ptr::drop_in_place<arbitrage_bot::config::BotConfig>
+0000000000089530 t core::ptr::drop_in_place<arbitrage_bot::run_single_market::{{closure}}>
+0000000000089670 t arbitrage_bot::run_single_market::{{closure}}
+000000000008cc10 t core::ptr::drop_in_place<arbitrage_bot::market::fetch::wait_for_market::{{closure}}>
+000000000008d250 t core::ptr::drop_in_place<arbitrage_bot::market::fetch::fetch_market_assets::{{closure}}>
+000000000008d380 t arbitrage_bot::market::fetch::fetch_market_assets::{{closure}}
+000000000008e700 t core::ptr::drop_in_place<alloc::vec::Vec<arbitrage_bot::market::types::GammaMarket>>
+000000000008e770 t core::ptr::drop_in_place<core::result::Result<alloc::vec::Vec<arbitrage_bot::market::types::GammaEvent>,reqwest::error::Error>>
+000000000008e8d0 t core::ptr::drop_in_place<arbitrage_bot::market::fetch::fetch_market_assets_direct::{{closure}}>
+000000000008e9b0 t arbitrage_bot::market::fetch::fetch_market_assets_direct::{{closure}}
+000000000008f700 t core::ptr::drop_in_place<arbitrage_bot::trading::client::TradingClient::new::{{closure}}>
+000000000008f8b0 t arbitrage_bot::trading::client::TradingClient::new::{{closure}}
+0000000000096ab0 t core::ptr::drop_in_place<alloc::sync::ArcInner<arbitrage_bot::trading::client::TradingClient>>
+0000000000096eb0 t core::ptr::drop_in_place<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}>
+0000000000097950 t arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}
+000000000009e390 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}>
+000000000009ef40 t arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}
+00000000000a62f0 t core::ptr::drop_in_place<arbitrage_bot::trading::client::TradingClient::cancel_all_open_orders::{{closure}}>
+00000000000a6400 t arbitrage_bot::trading::client::TradingClient::cancel_all_open_orders::{{closure}}
+00000000000aa2f0 t core::ptr::drop_in_place<arbitrage_bot::websocket::types::SubscribeMessage>
+00000000000aa450 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::process_ws_message::{{closure}}>
+00000000000aa4f0 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::handle_price_change::{{closure}}>
+00000000000aa7e0 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::handle_book_message::{{closure}}>
+00000000000aab10 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::orders::{{closure}}>
+00000000000aac60 t core::ptr::drop_in_place<alloc::vec::Vec<polymarket_client_sdk::clob::types::response::OpenOrderResponse>>
+00000000000aacc0 t core::ptr::drop_in_place<arbitrage_bot::websocket::spread_capture_ws::process_market_message::{{closure}}>
+00000000000aafc0 t core::ptr::drop_in_place<arbitrage_bot::websocket::spread_capture_ws::handle_price_change::{{closure}}>
+00000000000ab0e0 t core::ptr::drop_in_place<arbitrage_bot::websocket::spread_capture_ws::handle_book::{{closure}}>
+00000000000ab200 t core::ptr::drop_in_place<tokio::sync::mpsc::unbounded::UnboundedSender<arbitrage_bot::trading::client::FillEvent>>
+00000000000ab2d0 t core::ptr::drop_in_place<std::sync::poison::rwlock::RwLock<core::option::Option<tokio::sync::mpsc::unbounded::UnboundedSender<arbitrage_bot::trading::client::FillEvent>>>>
+00000000000ab3c0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::AuthenticationBuilder<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>::authenticate::{{closure}}>
+00000000000ab9e0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::ClientInner<polymarket_client_sdk::auth::state::Unauthenticated>::create_or_derive_api_key<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>::{{closure}}>
+00000000000aba60 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::ClientInner<polymarket_client_sdk::auth::state::Unauthenticated>::create_api_key<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>::{{closure}}>
+00000000000abb20 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::ClientInner<polymarket_client_sdk::auth::state::Unauthenticated>::create_headers<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>::{{closure}}>
+00000000000abb70 t polymarket_client_sdk::clob::client::ClientInner<polymarket_client_sdk::auth::state::Unauthenticated>::create_headers::{{closure}}
+00000000000ad240 t core::ptr::drop_in_place<polymarket_client_sdk::auth::l1::create_headers<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>::{{closure}}>
+00000000000ad340 t polymarket_client_sdk::request::{{closure}}
+00000000000adf50 t core::ptr::drop_in_place<alloc::sync::ArcInner<polymarket_client_sdk::clob::client::ClientInner<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>>>
+00000000000ae1f0 t core::ptr::drop_in_place<polymarket_client_sdk::auth::Credentials>
+00000000000ae3b0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::AuthenticationBuilder<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>::send_debug_data::{{closure}}>
+00000000000ae490 t core::ptr::drop_in_place<dashmap::DashMap<ruint::Uint<256_usize,4_usize>,polymarket_client_sdk::clob::types::TickSize>>
+00000000000ae520 t core::ptr::drop_in_place<arbitrage_bot::auth::derive_api_credentials::{{closure}}>
+00000000000ae850 t core::ptr::drop_in_place<arbitrage_bot::auth::ClobAuth>
+00000000000aeb40 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::AuthenticationBuilder<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>>
+00000000000af2b0 t core::ptr::drop_in_place<alloc::vec::Vec<arbitrage_bot::market::types::GammaEvent>>
+00000000000afa50 t core::ptr::drop_in_place<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}}>.3778
+00000000000afbe0 t core::ptr::drop_in_place<arbitrage_bot::websocket::spread_capture_ws::run_side_capture::{{closure}}>.3779
+00000000000b0870 t core::ptr::drop_in_place<polymarket_client_sdk::clob::order_builder::OrderBuilder<polymarket_client_sdk::clob::order_builder::Limit,polymarket_client_sdk::auth::Normal>::build::{{closure}}>.3782
+00000000000b09f0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::sign<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>::{{closure}}>.3783
+00000000000b0b80 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::post_orders::{{closure}}>.3784
+00000000000b0d40 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::cancel_order::{{closure}}>.3786
+00000000000b0e30 t core::ptr::drop_in_place<polymarket_client_sdk::request<polymarket_client_sdk::clob::types::response::FeeRateResponse>::{{closure}}>
+00000000000b11d0 t core::ptr::drop_in_place<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>
+00000000000b1310 t core::ptr::drop_in_place<tokio::runtime::task::core::Stage<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}}>>
+00000000000b1390 t core::ptr::drop_in_place<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>
+00000000000b14d0 t core::ptr::drop_in_place<tokio::runtime::task::core::Stage<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>>
+00000000000b1550 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>.3832
+00000000000b1e30 t core::ptr::drop_in_place<arbitrage_bot::trading::client::TradingClient::place_batch_buy_orders::{{closure}}>.3833
+00000000000b1fc0 t core::ptr::drop_in_place<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>
+00000000000b20f0 t core::ptr::drop_in_place<tokio::runtime::task::core::Stage<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>>
+00000000000b2160 t core::ptr::drop_in_place<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>
+00000000000b22a0 t core::ptr::drop_in_place<tokio::runtime::task::core::Stage<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}}>>
+00000000000b2320 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>.3838
+00000000000b2440 t core::ptr::drop_in_place<arbitrage_bot::websocket::user_ws::run_user_ws_monitor::{{closure}}>.3840
+00000000000b2c50 t core::ptr::drop_in_place<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>
+00000000000b2d90 t core::ptr::drop_in_place<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>
+00000000000b2ed0 t core::ptr::drop_in_place<tokio::runtime::task::core::Stage<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>>
+00000000000b2f50 t core::ptr::drop_in_place<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>
+00000000000b3090 t core::ptr::drop_in_place<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>
+00000000000b31d0 t core::ptr::drop_in_place<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>
+00000000000b3310 t core::ptr::drop_in_place<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>
+00000000000b3450 t core::ptr::drop_in_place<tokio::runtime::task::core::Stage<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>>
+00000000000b34d0 t core::ptr::drop_in_place<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>
+00000000000b3600 t core::ptr::drop_in_place<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>
+00000000000b5f50 t arbitrage_bot::websocket::user_ws::run_user_ws_monitor::{{closure}}.3880
+00000000000c2b80 t arbitrage_bot::trading::client::TradingClient::cancel_orders::{{closure}}.3896
+00000000000c5390 t arbitrage_bot::trading::client::TradingClient::place_batch_buy_orders::{{closure}}.3899
+00000000000c9cd0 t arbitrage_bot::trading::client::TradingClient::place_batch_buy_orders::{{closure}}::{{closure}}.3900
+00000000000c9f20 t polymarket_client_sdk::clob::order_builder::OrderBuilder<polymarket_client_sdk::clob::order_builder::Limit,K>::build::{{closure}}.3901
+00000000000ce810 t polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<K>>::sign::{{closure}}.3902
+00000000000d0ef0 t polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<K>>::post_orders::{{closure}}.3905
+00000000000d7080 t core::ptr::drop_in_place<alloc::vec::Vec<polymarket_client_sdk::clob::types::response::PostOrderResponse>>.3907
+00000000000d70e0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::create_headers::{{closure}}>.3908
+00000000000d7130 t polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<K>>::create_headers::{{closure}}.3909
+00000000000d9210 t core::ptr::drop_in_place<core::option::Option<alloc::vec::Vec<polymarket_client_sdk::clob::types::response::PostOrderResponse>>>.3913
+00000000000d9280 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::server_time::{{closure}}>.3916
+00000000000d9e90 t arbitrage_bot::websocket::spread_capture_ws::run_side_capture::{{closure}}.3930
+00000000000e1980 t core::ptr::drop_in_place<arbitrage_bot::trading::client::TradingClient::place_single_order::{{closure}}>.3932
+00000000000e1a10 t arbitrage_bot::trading::client::TradingClient::place_single_order::{{closure}}.3933
+00000000000e3b00 t arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}}
+00000000000e5f60 t core::ptr::drop_in_place<arbitrage_bot::main::{{closure}}>
+00000000000e6150 t arbitrage_bot::run_single_market::{{closure}}.3940
+00000000000e96f0 t arbitrage_bot::trading::client::TradingClient::new::{{closure}}.4051
+00000000000f08f0 t arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}.4054
+00000000000f7330 t arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}.4055
+00000000000fe670 t arbitrage_bot::trading::client::TradingClient::cancel_all_open_orders::{{closure}}.4058
+0000000000105a40 t polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<K>>::create_headers::{{closure}}.4086
+0000000000106f30 t polymarket_client_sdk::clob::client::ClientInner<polymarket_client_sdk::auth::state::Unauthenticated>::create_headers::{{closure}}.4114
+000000000010c040 t arbitrage_bot::run_single_market::{{closure}}.4141
+000000000010f5e0 t arbitrage_bot::trading::client::TradingClient::new::{{closure}}.4162
+00000000001167e0 t arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}.4167
+000000000011d220 t arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}.4169
+0000000000124560 t arbitrage_bot::trading::client::TradingClient::cancel_all_open_orders::{{closure}}.4173
+000000000012bb40 t polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<K>>::create_headers::{{closure}}.4240
+000000000012d030 t polymarket_client_sdk::clob::client::ClientInner<polymarket_client_sdk::auth::state::Unauthenticated>::create_headers::{{closure}}.4299
+000000000012e700 t core::ptr::drop_in_place<alloc::boxed::Box<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>>
+000000000012e850 t core::ptr::drop_in_place<alloc::boxed::Box<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>>
+000000000012e9a0 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>.4353
+000000000012fb10 t core::ptr::drop_in_place<alloc::boxed::Box<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>>
+000000000012fc60 t core::ptr::drop_in_place<tokio::runtime::task::core::Stage<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>>.4383
+000000000012fce0 t core::ptr::drop_in_place<alloc::boxed::Box<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>>
+000000000012fe30 t core::ptr::drop_in_place<alloc::boxed::Box<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>>
+000000000012ff80 t core::ptr::drop_in_place<alloc::boxed::Box<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>>
+00000000001300d0 t core::ptr::drop_in_place<alloc::boxed::Box<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>>
+0000000000130220 t core::ptr::drop_in_place<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}}>.4400
+0000000000131090 t core::ptr::drop_in_place<polymarket_client_sdk::clob::order_builder::OrderBuilder<polymarket_client_sdk::clob::order_builder::Limit,polymarket_client_sdk::auth::Normal>::build::{{closure}}>.4401
+00000000001315e0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::sign<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>::{{closure}}>.4402
+0000000000131930 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::post_orders::{{closure}}>.4403
+0000000000131c50 t core::ptr::drop_in_place<arbitrage_bot::trading::client::TradingClient::cancel_orders::{{closure}}>.4404
+0000000000131ec0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::create_headers::{{closure}}>.4409
+00000000001323b0 t core::ptr::drop_in_place<alloc::boxed::Box<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>>
+0000000000132500 t core::ptr::drop_in_place<tokio::runtime::task::core::Stage<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>>.4441
+0000000000132580 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>.4442
+0000000000132fd0 t core::ptr::drop_in_place<alloc::boxed::Box<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>>
+0000000000133120 t core::ptr::drop_in_place<tokio::runtime::task::core::Stage<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}}>>.4454
+00000000001331a0 t core::ptr::drop_in_place<alloc::boxed::Box<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>>
+00000000001332f0 t core::ptr::drop_in_place<alloc::boxed::Box<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>>
+0000000000133440 t core::ptr::drop_in_place<alloc::boxed::Box<tokio::runtime::task::core::Cell<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}},alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>>
+0000000000135f00 t core::ptr::drop_in_place<alloc::vec::Vec<polymarket_client_sdk::clob::types::response::OpenOrderResponse>>.4799
+0000000000135f60 t core::ptr::drop_in_place<polymarket_client_sdk::clob::types::response::OpenOrderResponse>
+0000000000136040 t core::ptr::drop_in_place<polymarket_client_sdk::clob::types::response::Page<polymarket_client_sdk::clob::types::response::OpenOrderResponse>>.4800
+00000000001364a0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::types::response::CancelOrdersResponse>
+0000000000136520 t core::ptr::drop_in_place<alloc::vec::Vec<polymarket_client_sdk::clob::types::response::PostOrderResponse>>.4821
+0000000000136580 t core::ptr::drop_in_place<polymarket_client_sdk::clob::types::response::PostOrderResponse>
+0000000000142aa0 t core::ptr::drop_in_place<arbitrage_bot::main::{{closure}}>.4959
+0000000000142c90 t core::ptr::drop_in_place<arbitrage_bot::run_single_market::{{closure}}>.4960
+0000000000145560 t core::ptr::drop_in_place<arbitrage_bot::market::fetch::fetch_market_assets::{{closure}}>.4968
+0000000000145640 t core::ptr::drop_in_place<arbitrage_bot::market::fetch::fetch_market_assets_direct::{{closure}}>.4969
+00000000001457b0 t core::ptr::drop_in_place<core::result::Result<alloc::vec::Vec<arbitrage_bot::market::types::GammaEvent>,reqwest::error::Error>>.4972
+0000000000145910 t core::ptr::drop_in_place<core::option::Option<polymarket_client_sdk::auth::Credentials>>
+0000000000145ae0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::ClientInner<polymarket_client_sdk::auth::state::Unauthenticated>::create_headers<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>::{{closure}}>.4974
+0000000000145c20 t core::ptr::drop_in_place<polymarket_client_sdk::request<polymarket_client_sdk::auth::Credentials>::{{closure}}>.4975
+00000000001460b0 t core::ptr::drop_in_place<arbitrage_bot::trading::client::TradingClient::cancel_all_open_orders::{{closure}}>.4988
+00000000001470a0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::create_headers::{{closure}}>.5000
+000000000014b610 t arbitrage_bot::websocket::types::_::<impl serde_core::ser::Serialize for arbitrage_bot::websocket::types::SubscribeMessage>::serialize
+000000000014f0a0 t core::ptr::drop_in_place<core::option::Option<arbitrage_bot::auth::ApiCredentials>>
+000000000014f2e0 t core::ptr::drop_in_place<arbitrage_bot::main::{{closure}}>.5152
+000000000014f4d0 t core::ptr::drop_in_place<arbitrage_bot::run_single_market::{{closure}}>.5153
+0000000000151cd0 t core::ptr::drop_in_place<arbitrage_bot::market::fetch::fetch_market_assets::{{closure}}>.5160
+0000000000151db0 t core::ptr::drop_in_place<arbitrage_bot::market::fetch::fetch_market_assets_direct::{{closure}}>.5161
+0000000000151f90 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::ClientInner<polymarket_client_sdk::auth::state::Unauthenticated>::create_headers<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>::{{closure}}>.5168
+00000000001520d0 t core::ptr::drop_in_place<polymarket_client_sdk::request<polymarket_client_sdk::auth::Credentials>::{{closure}}>.5169
+00000000001522b0 t core::ptr::drop_in_place<arbitrage_bot::trading::client::TradingClient::cancel_all_open_orders::{{closure}}>.5177
+0000000000153120 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::create_headers::{{closure}}>.5193
+0000000000154150 t core::ptr::drop_in_place<arbitrage_bot::market::types::GammaMarketDirect>
+000000000015a830 t core::ptr::drop_in_place<polymarket_client_sdk::clob::types::response::PostOrderResponse>.5294
+000000000015a8f0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::types::response::OpenOrderResponse>.5298
+000000000015a9c0 t <polymarket_client_sdk::clob::types::response::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::response::OpenOrderResponse>::deserialize::__FieldVisitor as serde_core::de::Visitor>::visit_str
+000000000015ac00 t <polymarket_client_sdk::clob::types::response::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::response::PostOrderResponse>::deserialize::__FieldVisitor as serde_core::de::Visitor>::visit_str
+000000000015ad70 t <<polymarket_client_sdk::clob::types::response::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::response::OpenOrderResponse>::deserialize::__Visitor as serde_core::de::Visitor>::visit_map::__DeserializeWith as serde_core::de::Deserialize>::deserialize
+000000000015b2a0 t <<polymarket_client_sdk::clob::types::response::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::response::OpenOrderResponse>::deserialize::__Visitor as serde_core::de::Visitor>::visit_map::__DeserializeWith as serde_core::de::Deserialize>::deserialize
+000000000015b690 t <<polymarket_client_sdk::clob::types::response::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::response::OpenOrderResponse>::deserialize::__Visitor as serde_core::de::Visitor>::visit_map::__DeserializeWith as serde_core::de::Deserialize>::deserialize
+000000000015b830 t <<polymarket_client_sdk::clob::types::response::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::response::PostOrderResponse>::deserialize::__Visitor as serde_core::de::Visitor>::visit_map::__DeserializeWith as serde_core::de::Deserialize>::deserialize
+000000000015bbb0 t <<polymarket_client_sdk::clob::types::response::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::response::PostOrderResponse>::deserialize::__Visitor as serde_core::de::Visitor>::visit_map::__DeserializeWith as serde_core::de::Deserialize>::deserialize
+000000000015bf30 t <<polymarket_client_sdk::clob::types::response::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::response::CancelOrdersResponse>::deserialize::__Visitor as serde_core::de::Visitor>::visit_map::__DeserializeWith as serde_core::de::Deserialize>::deserialize
+000000000015d110 t core::ptr::drop_in_place<arbitrage_bot::market::types::GammaEvent>.5438
+000000000015d1c0 t core::ptr::drop_in_place<core::result::Result<alloc::vec::Vec<arbitrage_bot::market::types::GammaEvent>,serde_json::error::Error>>
+000000000015d300 t core::ptr::drop_in_place<core::option::Option<alloc::vec::Vec<arbitrage_bot::market::types::GammaMarket>>>.5439
+000000000015d460 t core::ptr::drop_in_place<core::result::Result<alloc::vec::Vec<arbitrage_bot::market::types::GammaMarket>,serde_json::error::Error>>
+000000000015e120 t core::ptr::drop_in_place<core::result::Result<arbitrage_bot::market::types::GammaEvent,serde_json::error::Error>>
+000000000015e990 t core::ptr::drop_in_place<core::result::Result<arbitrage_bot::market::types::GammaMarket,serde_json::error::Error>>
+000000000015e9f0 t core::ptr::drop_in_place<core::result::Result<arbitrage_bot::market::types::GammaMarketDirect,serde_json::error::Error>>
+00000000001630f0 t core::ptr::drop_in_place<core::result::Result<arbitrage_bot::config::BotConfig,serde_json::error::Error>>
+00000000001672c0 t arbitrage_bot::main
+0000000000168930 t core::ptr::drop_in_place<arbitrage_bot::main::{{closure}}>.5559
+0000000000168b20 t core::ptr::drop_in_place<arbitrage_bot::run_single_market::{{closure}}>.5560
+000000000016b4d0 t core::ptr::drop_in_place<arbitrage_bot::market::fetch::fetch_market_assets::{{closure}}>.5567
+000000000016b5b0 t core::ptr::drop_in_place<arbitrage_bot::market::fetch::fetch_market_assets_direct::{{closure}}>.5568
+000000000016b660 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::ClientInner<polymarket_client_sdk::auth::state::Unauthenticated>::create_headers<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>::{{closure}}>.5574
+000000000016b7a0 t core::ptr::drop_in_place<polymarket_client_sdk::request<polymarket_client_sdk::auth::Credentials>::{{closure}}>.5575
+000000000016bd20 t core::ptr::drop_in_place<dashmap::DashMap<ruint::Uint<256_usize,4_usize>,polymarket_client_sdk::clob::types::TickSize>>.5580
+000000000016bd90 t core::ptr::drop_in_place<arbitrage_bot::trading::client::TradingClient::cancel_all_open_orders::{{closure}}>.5586
+000000000016cd60 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::create_headers::{{closure}}>.5596
+0000000000170e20 t arbitrage_bot::utils::now_str
+0000000000176fc0 t arbitrage_bot::config::default_trade_side
+0000000000177010 t arbitrage_bot::config::BotConfig::load_from_file
+0000000000177480 t arbitrage_bot::config::BotConfig::merge_with_args
+0000000000177790 t arbitrage_bot::config::Args::detect_explicit_args
+000000000017a8d0 t <arbitrage_bot::config::Args as clap_builder::derive::Args>::augment_args
+000000000017fba0 t arbitrage_bot::market::time::is_standard_slug
+000000000017ff40 t arbitrage_bot::market::time::generate_slug
+0000000000180440 t arbitrage_bot::market::time::get_window_start_from_slug
+0000000000180e40 t arbitrage_bot::market::time::get_window_end_from_slug
+0000000000181220 t arbitrage_bot::market::time::is_in_window
+0000000000181330 t arbitrage_bot::market::time::format_timestamp
+000000000018a180 t polymarket_client_sdk::serde_helpers::deserialize_with_warnings
+000000000018a280 t polymarket_client_sdk::serde_helpers::deserialize_with_warnings
+000000000018aa20 t polymarket_client_sdk::serde_helpers::deserialize_with_warnings
+000000000018b2a0 t polymarket_client_sdk::serde_helpers::deserialize_with_warnings
+000000000018b9d0 t polymarket_client_sdk::serde_helpers::deserialize_with_warnings
+000000000018cba0 t polymarket_client_sdk::serde_helpers::deserialize_with_warnings
+000000000018dd10 t polymarket_client_sdk::serde_helpers::deserialize_with_warnings
+00000000001943d0 t core::ptr::drop_in_place<anyhow::error::ErrorImpl<anyhow::error::ContextError<&str,polymarket_client_sdk::error::Error>>>
+0000000000194420 t core::ptr::drop_in_place<polymarket_client_sdk::error::Error>.5989
+0000000000194740 t core::ptr::drop_in_place<anyhow::error::ContextError<&str,polymarket_client_sdk::error::Error>>
+0000000000194880 t <polymarket_client_sdk::error::Error as core::fmt::Debug>::fmt
+0000000000196260 t core::ptr::drop_in_place<anyhow::error::ErrorImpl<polymarket_client_sdk::error::Error>>
+000000000019f330 t core::ptr::drop_in_place<arbitrage_bot::run_single_market::{{closure}}>.6162
+00000000001a1860 t core::ptr::drop_in_place<core::option::Option<polymarket_client_sdk::auth::Credentials>>.6177
+00000000001a6420 t arbitrage_bot::trading::client::TradingClient::get_position
+00000000001a6540 t core::ptr::drop_in_place<std::sync::poison::PoisonError<std::sync::poison::rwlock::RwLockReadGuard<arbitrage_bot::trading::position::Position>>>
+00000000001a6560 t arbitrage_bot::trading::client::TradingClient::add_filled_shares
+00000000001a6870 t core::ptr::drop_in_place<std::sync::poison::PoisonError<std::sync::poison::rwlock::RwLockWriteGuard<arbitrage_bot::trading::position::Position>>>
+00000000001a68c0 t arbitrage_bot::trading::client::TradingClient::get_api_creds
+00000000001a6aa0 t arbitrage_bot::trading::client::TradingClient::register_order
+00000000001a6ed0 t arbitrage_bot::trading::client::TradingClient::subtract_filled_shares
+00000000001a71e0 t arbitrage_bot::trading::client::TradingClient::set_fill_notifier
+00000000001a8420 t core::ptr::drop_in_place<alloc::sync::ArcInner<tokio::sync::mpsc::chan::Chan<arbitrage_bot::trading::client::FillEvent,tokio::sync::mpsc::unbounded::Semaphore>>>
+00000000001a8c30 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>.6445
+00000000001a9660 t core::ptr::drop_in_place<arbitrage_bot::trading::client::TradingClient::cancel_orders::{{closure}}>.6447
+00000000001a98d0 t core::ptr::drop_in_place<polymarket_client_sdk::clob::order_builder::OrderBuilder<polymarket_client_sdk::clob::order_builder::Limit,polymarket_client_sdk::auth::Normal>::build::{{closure}}>.6448
+00000000001a9e40 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::sign<alloy_signer_local::LocalSigner<ecdsa::signing::SigningKey<k256::Secp256k1>>>::{{closure}}>.6449
+00000000001aa190 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::post_orders::{{closure}}>.6450
+00000000001aa4c0 t core::ptr::drop_in_place<alloc::vec::Vec<polymarket_client_sdk::clob::types::SignedOrder>>.6452
+00000000001aa550 t core::ptr::drop_in_place<polymarket_client_sdk::clob::client::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>::create_headers::{{closure}}>.6454
+00000000001ab530 t core::ptr::drop_in_place<polymarket_client_sdk::clob::order_builder::OrderBuilder<polymarket_client_sdk::clob::order_builder::Limit,polymarket_client_sdk::auth::Normal>>.6485
+00000000001abc80 t core::ptr::drop_in_place<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}}>.6490
+00000000001aca70 t core::ptr::drop_in_place<tokio::sync::mpsc::unbounded::UnboundedReceiver<arbitrage_bot::trading::client::FillEvent>>.6491
+00000000001acbf0 t core::ptr::drop_in_place<alloc::vec::Vec<arbitrage_bot::trading::client::FillEvent>>.6492
+00000000001acc60 t core::ptr::drop_in_place<arbitrage_bot::websocket::spread_capture_ws::PositionState>.6493
+00000000001ad3c0 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>.6497
+00000000001adc10 t core::ptr::drop_in_place<arbitrage_bot::websocket::market_ws::run_trading_loop::{{closure}}::{{closure}}>.6500
+00000000001aeca0 t core::ptr::drop_in_place<arbitrage_bot::auth::ApiCredentials>.6501
+00000000001aece0 t core::ptr::drop_in_place<arbitrage_bot::market::types::MarketAssets>.6503
+00000000001af300 t core::ptr::drop_in_place<arbitrage_bot::websocket::types::UserSubscribeMessage>.6512
+00000000001b01f0 t core::ptr::drop_in_place<arbitrage_bot::websocket::spread_capture_ws::run_spread_capture_loop::{{closure}}::{{closure}}>.6525
+00000000001b4940 t polymarket_client_sdk::ToQueryParams::query_params
+00000000001b4ee0 t polymarket_client_sdk::clob::types::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::OrderType>::deserialize
+00000000001b50b0 t polymarket_client_sdk::clob::types::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::OrderStatusType>::deserialize
+00000000001b51d0 t polymarket_client_sdk::clob::types::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::Side>::deserialize
+00000000001b56e0 t <polymarket_client_sdk::clob::types::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::OrderType>::deserialize::{{closure}}::__FieldVisitor as serde_core::de::Visitor>::visit_bytes
+00000000001b5830 t <polymarket_client_sdk::clob::types::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::OrderType>::deserialize::{{closure}}::__FieldVisitor as serde_core::de::Visitor>::visit_str
+00000000001b5940 t <polymarket_client_sdk::clob::types::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::OrderStatusType>::deserialize::{{closure}}::__FieldVisitor as serde_core::de::Visitor>::visit_bytes
+00000000001b5cc0 t <polymarket_client_sdk::clob::types::_::<impl serde_core::de::Deserialize for polymarket_client_sdk::clob::types::OrderStatusType>::deserialize::{{closure}}::__FieldVisitor as serde_core::de::Visitor>::visit_str
+000000000029b250 t polymarket_client_sdk::auth::to_message
+000000000029b5c0 t polymarket_client_sdk::auth::hmac
+000000000029ce80 t <polymarket_client_sdk::auth::Normal as polymarket_client_sdk::auth::Kind>::extra_headers
+000000000029ced0 t core::ptr::drop_in_place<<polymarket_client_sdk::auth::Normal as polymarket_client_sdk::auth::Kind>::extra_headers::{{closure}}>
+000000000029cee0 t <polymarket_client_sdk::auth::Normal as polymarket_client_sdk::auth::Kind>::extra_headers::{{closure}}
+000000000029d030 t <polymarket_client_sdk::error::MissingContractConfig as core::fmt::Debug>::fmt
+000000000029d110 t <polymarket_client_sdk::error::MissingContractConfig as core::fmt::Display>::fmt
+000000000029d1b0 t <polymarket_client_sdk::error::Error as core::fmt::Display>::fmt
+000000000029d280 t <polymarket_client_sdk::error::Kind as core::fmt::Debug>::fmt.12382
+000000000029d2b0 t <polymarket_client_sdk::error::Status as core::fmt::Display>::fmt
+000000000029d350 t <polymarket_client_sdk::error::Validation as core::fmt::Display>::fmt
+000000000029d3b0 t <polymarket_client_sdk::error::Synchronization as core::fmt::Display>::fmt
+000000000029d600 t <polymarket_client_sdk::error::Error as core::convert::From<reqwest::error::Error>>::from
+000000000029d790 t <polymarket_client_sdk::error::Error as core::convert::From<http::header::value::InvalidHeaderValue>>::from
+000000000029d800 t <polymarket_client_sdk::error::Error as core::convert::From<serde_json::error::Error>>::from
+000000000029d8b0 t <polymarket_client_sdk::error::Error as core::convert::From<alloy_signer::error::Error>>::from
+000000000029e7c0 t <polymarket_client_sdk::error::Error as core::convert::From<polymarket_client_sdk::error::Validation>>::from
+000000000029e880 t <polymarket_client_sdk::error::Validation as core::fmt::Debug>::fmt
+000000000029ea20 t <polymarket_client_sdk::error::Error as core::convert::From<polymarket_client_sdk::error::Status>>::from
+000000000029eaf0 t core::ptr::drop_in_place<polymarket_client_sdk::error::Status>
+000000000029eb30 t <polymarket_client_sdk::error::Status as core::fmt::Debug>::fmt
+000000000029ebf0 t <polymarket_client_sdk::error::Synchronization as core::fmt::Debug>::fmt
+000000000029ecd0 t polymarket_client_sdk::clob::client::Client::new
+00000000002a09d0 t core::ptr::drop_in_place<dashmap::DashMap<ruint::Uint<256_usize,4_usize>,polymarket_client_sdk::clob::types::TickSize>>
+00000000002a0a60 t core::ptr::drop_in_place<alloc::sync::ArcInner<polymarket_client_sdk::clob::client::ClientInner<polymarket_client_sdk::auth::state::Unauthenticated>>>
+00000000002a29d0 t polymarket_client_sdk::clob::order_builder::to_fixed_u128
+00000000002a2b20 t polymarket_client_sdk::clob::order_builder::generate_seed
+00000000002a2d60 t polymarket_client_sdk::derive_proxy_wallet
+00000000002a2e30 t polymarket_client_sdk::derive_safe_wallet
+00000000002a3020 t <polymarket_client_sdk::clob::types::TickSize as core::convert::TryFrom<rust_decimal::decimal::Decimal>>::try_from
+00000000002a3140 t <polymarket_client_sdk::clob::types::Side as core::fmt::Display>::fmt
+00000000002a3190 t <polymarket_client_sdk::clob::types::SignatureType as core::fmt::Display>::fmt

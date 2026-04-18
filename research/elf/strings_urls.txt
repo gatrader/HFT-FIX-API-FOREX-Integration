@@ -1,0 +1,12 @@
+https://clob.polymarket.com
+https://clob.polymarket.com/auth/api-keyFailed
+https://clob.polymarket.com/auth/derive-api-keyFailed
+https://docs.rs/getrandom
+https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html
+https://gabagool22.com/api/verify-balancing-confauth/api-keyauth/derive-api-keydata/orders/usr/local/cargo/git/checkouts/rs-clob-client-971b3f32531b839b/0518317/src/lib.rsUnable
+https://gamma-api.polymarket.com/events
+https://gamma-api.polymarket.com/markets/slug/src/market/fetch.rs
+https://github.com/clap-rs/clap/issues/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/clap_builder-4.5.58/src/parser/validator.rsTryFromIntError
+https://polymarket.comFromUtf8Errorbytes/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base64-0.22.1/src/engine/mod.rsVec
+wss://ws-subscriptions-clob.polymarket.com/ws/marketsrc/websocket/market_ws.rs
+wss://ws-subscriptions-clob.polymarket.com/ws/usersrc/websocket/user_ws.rs
