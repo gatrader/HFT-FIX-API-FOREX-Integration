@@ -1,0 +1,18 @@
+services:
+  gabagool:
+    image: arbigab:latest
+    container_name: gabagool-dashboard
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - NODE_ENV=production
+      - BOT_BINARY_PATH=/app/bin/arbitrage_bot
+      - DATABASE_URL=file:/app/web/data/gabagool.db
+      - GABAGOOL_API_URL=https://gabagool22.com
+    volumes:
+      - gabagool-data:/app/web/data
+
+volumes:
+  gabagool-data:
+    driver: local

@@ -1,0 +1,2 @@
+(self.webpackChunk_N_E=self.webpackChunk_N_E||[]).push([[118],{762:(e,n,s)=>{"use strict";async function _(){}s.r(n),s.d(n,{register:()=>_}),process.env.GABAGOOL_API_URL}},e=>{var n=e(e.s=762);(_ENTRIES="undefined"==typeof _ENTRIES?{}:_ENTRIES).middleware_instrumentation=n}]);
+//# sourceMappingURL=edge-instrumentation.js.map

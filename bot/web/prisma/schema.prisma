@@ -1,0 +1,208 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// WORKSPACE LAYER
+// ============================================================================
+
+model Workspace {
+  id        String       @id @default(uuid())
+  name      String
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+  botNodes  BotNode[]
+  marketNodes MarketNode[]
+}
+
+model BotNode {
+  id                   String       @id @default(uuid())
+  workspaceId          String
+  workspace            Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name                 String
+  positionX            Float        @default(0)
+  positionY            Float        @default(0)
+  // Strategy type: "dutch_book" | "spread_capture"
+  strategy             String       @default("dutch_book")
+  // ── General parameters (shared across all strategies) ──
+  dryRun               Boolean      @default(false)
+  logPrice             Boolean      @default(true)
+  cancelOrdersOnStart  Boolean      @default(true)
+  minPrice             Float        @default(0.0)
+  maxPrice             Float        @default(1.0)
+  stopBeforeEndMs      Int          @default(0)
+  // Safety: stop if cumulative PnL drops below -maxLoss (0 = disabled)
+  maxLoss              Float        @default(0.0)
+  // Secured Gamble: allow algo to gamble a leg when both legs are positive
+  enableGamble         Boolean      @default(false)
+  // ── Dutch Book Arbitrage parameters ──
+  spreadThreshold      Float        @default(0.02)
+  maxBuyOrderSize      Float        @default(5.0)
+  tradeCooldown        Int          @default(5000)
+  balanceFactor        Float        @default(0.0)
+  // ── Dry-run spread reducer ──
+  spreadReducerProb    Float        @default(0.0)
+  spreadReducerValue   Float        @default(0.0)
+  // ── Spread Capture parameters ──
+  targetSpread         Float        @default(0.03)
+  orderSize            Float        @default(10.0)
+  maxPositionSize      Float        @default(50.0)
+  refreshIntervalMs    Int          @default(2000)
+  edgeThreshold        Float        @default(0.01)
+  inventorySkew        Float        @default(0.5)
+  // Per-node credential overrides (null = use global)
+  privateKey           String?
+  funderAddress        String?
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+  marketNodes          MarketNode[]
+
+  @@index([workspaceId])
+}
+
+model MarketNode {
+  id                String       @id @default(uuid())
+  workspaceId       String
+  workspace         Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  botNodeId         String?
+  botNode           BotNode?     @relation(fields: [botNodeId], references: [id], onDelete: SetNull)
+  name              String       @default("")
+  positionX         Float        @default(0)
+  positionY         Float        @default(0)
+  // Market data from Polymarket API
+  polymarketId      String?      // market id from API
+  conditionId       String?      // conditionId for trading
+  question          String?      // market question
+  image             String?      // market image URL
+  marketEndDate     String?      // end date string
+  // Targeting
+  mode              String       @default("periodic") // "periodic" | "slug"
+  slug              String?      // for one-shot mode
+  symbol            String       @default("btc")       // for periodic mode
+  intervalMinutes   Int          @default(5)            // for periodic mode
+  currentMarket     Boolean      @default(false)        // for periodic mode
+  // Runtime
+  status            String       @default("stopped")    // "stopped" | "running" | "error"
+  // Trade side for spread capture: "up" (YES) or "down" (NO)
+  tradeSide         String       @default("up")
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  markets           Market[]     @relation("MarketNodeMarkets")
+
+  @@index([workspaceId])
+  @@index([botNodeId])
+}
+
+// ============================================================================
+// LEGACY BOT MODEL (kept for backward compat, will be migrated)
+// ============================================================================
+
+model Bot {
+  id                   String   @id @default(uuid())
+  name                 String
+  symbol               String   @default("btc")
+  intervalMinutes      Int      @default(15)
+  dryRun               Boolean  @default(false)
+  maxBuyOrderSize      Float    @default(5.0)
+  spreadThreshold      Float    @default(0.02)
+  tradeCooldown        Int      @default(5000)
+  balanceFactor        Float    @default(0.0)
+  currentMarket        Boolean  @default(false)
+  logPrice             Boolean  @default(true)
+  stopBeforeEndMs      Int      @default(0)
+  minPrice             Float    @default(0.0)
+  maxPrice             Float    @default(1.0)
+  slug                 String?
+  cancelOrdersOnStart  Boolean  @default(true)
+  privateKey           String?
+  funderAddress        String?
+  status               String   @default("stopped")
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  markets              Market[]
+}
+
+// ============================================================================
+// EXECUTION RECORDS
+// ============================================================================
+
+model Market {
+  id             String          @id @default(uuid())
+  botId          String?
+  bot            Bot?            @relation(fields: [botId], references: [id], onDelete: Cascade)
+  marketNodeId   String?
+  marketNode     MarketNode?     @relation("MarketNodeMarkets", fields: [marketNodeId], references: [id], onDelete: Cascade)
+  slug           String
+  symbol         String
+  windowStart    Int
+  windowEnd      Int
+  dryRun         Boolean         @default(false)
+  strategy       String          @default("dutch_book")
+  status         String          @default("active")
+  pnl            Float?
+  outcome        String?
+  createdAt      DateTime        @default(now())
+  trades         Trade[]
+  priceSnapshots PriceSnapshot[]
+
+  @@index([botId])
+  @@index([marketNodeId])
+}
+
+model Trade {
+  id         String   @id @default(uuid())
+  marketId   String
+  market     Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  side       String
+  size       Float
+  price      Float
+  traderSide String
+  timestamp  DateTime @default(now())
+
+  @@index([marketId])
+}
+
+model PriceSnapshot {
+  id        String   @id @default(uuid())
+  marketId  String
+  market    Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  upBid     Float
+  upAsk     Float
+  downBid   Float
+  downAsk   Float
+  timestamp DateTime @default(now())
+
+  @@index([marketId])
+}
+
+model Setting {
+  key   String @id
+  value String
+}
+
+model BotConfiguration {
+  id                   String   @id @default(uuid())
+  name                 String
+  type                 String   @default("custom")
+  symbol               String   @default("btc")
+  intervalMinutes      Int      @default(15)
+  dryRun               Boolean  @default(false)
+  maxBuyOrderSize      Float    @default(5.0)
+  spreadThreshold      Float    @default(0.02)
+  tradeCooldown        Int      @default(5000)
+  balanceFactor        Float    @default(0.0)
+  currentMarket        Boolean  @default(false)
+  logPrice             Boolean  @default(true)
+  stopBeforeEndMs      Int      @default(0)
+  minPrice             Float    @default(0.0)
+  maxPrice             Float    @default(1.0)
+  slug                 String?
+  cancelOrdersOnStart  Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
