@@ -1,0 +1,28 @@
+[
+  {
+    "proxyWallet": "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
+    "side": "BUY",
+    "asset": "111111",
+    "conditionId": "0xaaa",
+    "outcome": "Yes",
+    "size": 85.0,
+    "price": 0.47,
+    "timestamp": 1776530360,
+    "slug": "btc-up-or-down-2026-04-18-16utc",
+    "eventSlug": "btc-up-or-down",
+    "transactionHash": "0xcafebabe1"
+  },
+  {
+    "proxyWallet": "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
+    "side": "SELL",
+    "asset": "444444",
+    "conditionId": "0xddd",
+    "outcome": "No",
+    "size": 40.0,
+    "price": 0.39,
+    "timestamp": 1776350000,
+    "slug": "xrp-up-or-down-2026-04-15-12utc",
+    "eventSlug": "xrp-up-or-down",
+    "transactionHash": "0xcafebabe2"
+  }
+]

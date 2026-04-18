@@ -1,0 +1,14 @@
+[
+  {
+    "proxyWallet": "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
+    "asset": "111111",
+    "conditionId": "0xaaa",
+    "outcome": "Yes",
+    "size": 85.0,
+    "avgPrice": 0.47,
+    "cashPnl": 3.1,
+    "realizedPnl": 0.0,
+    "slug": "btc-up-or-down-2026-04-18-16utc",
+    "eventSlug": "btc-up-or-down"
+  }
+]

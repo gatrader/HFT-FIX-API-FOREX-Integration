@@ -1,0 +1,26 @@
+[
+  {
+    "proxyWallet": "0x0006af12cd4dacc450836a0e1ec6ce47365d8c63",
+    "asset": "111111",
+    "conditionId": "0xaaa",
+    "outcome": "Yes",
+    "size": 120.5,
+    "avgPrice": 0.48,
+    "cashPnl": 5.2,
+    "realizedPnl": 0.0,
+    "slug": "btc-up-or-down-2026-04-18-16utc",
+    "eventSlug": "btc-up-or-down"
+  },
+  {
+    "proxyWallet": "0x0006af12cd4dacc450836a0e1ec6ce47365d8c63",
+    "asset": "222222",
+    "conditionId": "0xbbb",
+    "outcome": "No",
+    "size": 30.0,
+    "avgPrice": 0.52,
+    "cashPnl": -1.1,
+    "realizedPnl": 0.0,
+    "slug": "eth-up-or-down-2026-04-18-16utc",
+    "eventSlug": "eth-up-or-down"
+  }
+]

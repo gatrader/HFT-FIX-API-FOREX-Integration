@@ -1,0 +1,178 @@
+{
+  "labels": [
+    "main",
+    "alt"
+  ],
+  "summary": {
+    "slug_count": 4,
+    "bot_slugs": 0,
+    "per_wallet_current_slugs": {
+      "main": 2,
+      "alt": 1
+    },
+    "per_wallet_historical_slugs": {
+      "main": 3,
+      "alt": 2
+    },
+    "bot_and_wallet_overlap": {
+      "main": 0,
+      "alt": 0
+    },
+    "between_wallet_overlap": 1
+  },
+  "slugs": {
+    "btc-up-or-down-2026-04-18-16utc": {
+      "bot_fills": [],
+      "wallets": {
+        "main": {
+          "positions": [
+            {
+              "slug": "btc-up-or-down-2026-04-18-16utc",
+              "event_slug": "btc-up-or-down",
+              "condition_id": "0xaaa",
+              "asset": "111111",
+              "outcome": "Yes",
+              "size": 120.5,
+              "avg_price": 0.48,
+              "cash_pnl": 5.2,
+              "realized_pnl": 0.0
+            }
+          ],
+          "trades": [
+            {
+              "slug": "btc-up-or-down-2026-04-18-16utc",
+              "event_slug": "btc-up-or-down",
+              "condition_id": "0xaaa",
+              "asset": "111111",
+              "side": "BUY",
+              "outcome": "Yes",
+              "size": 120.5,
+              "price": 0.48,
+              "ts_unix": 1776530400,
+              "tx": "0xdeadbeefcafe1"
+            }
+          ]
+        },
+        "alt": {
+          "positions": [
+            {
+              "slug": "btc-up-or-down-2026-04-18-16utc",
+              "event_slug": "btc-up-or-down",
+              "condition_id": "0xaaa",
+              "asset": "111111",
+              "outcome": "Yes",
+              "size": 85.0,
+              "avg_price": 0.47,
+              "cash_pnl": 3.1,
+              "realized_pnl": 0.0
+            }
+          ],
+          "trades": [
+            {
+              "slug": "btc-up-or-down-2026-04-18-16utc",
+              "event_slug": "btc-up-or-down",
+              "condition_id": "0xaaa",
+              "asset": "111111",
+              "side": "BUY",
+              "outcome": "Yes",
+              "size": 85.0,
+              "price": 0.47,
+              "ts_unix": 1776530360,
+              "tx": "0xcafebabe1"
+            }
+          ]
+        }
+      }
+    },
+    "eth-up-or-down-2026-04-18-16utc": {
+      "bot_fills": [],
+      "wallets": {
+        "main": {
+          "positions": [
+            {
+              "slug": "eth-up-or-down-2026-04-18-16utc",
+              "event_slug": "eth-up-or-down",
+              "condition_id": "0xbbb",
+              "asset": "222222",
+              "outcome": "No",
+              "size": 30.0,
+              "avg_price": 0.52,
+              "cash_pnl": -1.1,
+              "realized_pnl": 0.0
+            }
+          ],
+          "trades": [
+            {
+              "slug": "eth-up-or-down-2026-04-18-16utc",
+              "event_slug": "eth-up-or-down",
+              "condition_id": "0xbbb",
+              "asset": "222222",
+              "side": "BUY",
+              "outcome": "No",
+              "size": 30.0,
+              "price": 0.52,
+              "ts_unix": 1776530500,
+              "tx": "0xdeadbeefcafe2"
+            }
+          ]
+        },
+        "alt": {
+          "positions": [],
+          "trades": []
+        }
+      }
+    },
+    "sol-up-or-down-2026-04-17-18utc": {
+      "bot_fills": [],
+      "wallets": {
+        "main": {
+          "positions": [],
+          "trades": [
+            {
+              "slug": "sol-up-or-down-2026-04-17-18utc",
+              "event_slug": "sol-up-or-down",
+              "condition_id": "0xccc",
+              "asset": "333333",
+              "side": "SELL",
+              "outcome": "Yes",
+              "size": 10.0,
+              "price": 0.61,
+              "ts_unix": 1776440000,
+              "tx": "0xdeadbeefcafe3"
+            }
+          ]
+        },
+        "alt": {
+          "positions": [],
+          "trades": []
+        }
+      }
+    },
+    "xrp-up-or-down-2026-04-15-12utc": {
+      "bot_fills": [],
+      "wallets": {
+        "main": {
+          "positions": [],
+          "trades": []
+        },
+        "alt": {
+          "positions": [],
+          "trades": [
+            {
+              "slug": "xrp-up-or-down-2026-04-15-12utc",
+              "event_slug": "xrp-up-or-down",
+              "condition_id": "0xddd",
+              "asset": "444444",
+              "side": "SELL",
+              "outcome": "No",
+              "size": 40.0,
+              "price": 0.39,
+              "ts_unix": 1776350000,
+              "tx": "0xcafebabe2"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

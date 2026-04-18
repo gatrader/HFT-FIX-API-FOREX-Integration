@@ -1,0 +1,41 @@
+[
+  {
+    "proxyWallet": "0x0006af12cd4dacc450836a0e1ec6ce47365d8c63",
+    "side": "BUY",
+    "asset": "111111",
+    "conditionId": "0xaaa",
+    "outcome": "Yes",
+    "size": 120.5,
+    "price": 0.48,
+    "timestamp": 1776530400,
+    "slug": "btc-up-or-down-2026-04-18-16utc",
+    "eventSlug": "btc-up-or-down",
+    "transactionHash": "0xdeadbeefcafe1"
+  },
+  {
+    "proxyWallet": "0x0006af12cd4dacc450836a0e1ec6ce47365d8c63",
+    "side": "BUY",
+    "asset": "222222",
+    "conditionId": "0xbbb",
+    "outcome": "No",
+    "size": 30.0,
+    "price": 0.52,
+    "timestamp": 1776530500,
+    "slug": "eth-up-or-down-2026-04-18-16utc",
+    "eventSlug": "eth-up-or-down",
+    "transactionHash": "0xdeadbeefcafe2"
+  },
+  {
+    "proxyWallet": "0x0006af12cd4dacc450836a0e1ec6ce47365d8c63",
+    "side": "SELL",
+    "asset": "333333",
+    "conditionId": "0xccc",
+    "outcome": "Yes",
+    "size": 10.0,
+    "price": 0.61,
+    "timestamp": 1776440000,
+    "slug": "sol-up-or-down-2026-04-17-18utc",
+    "eventSlug": "sol-up-or-down",
+    "transactionHash": "0xdeadbeefcafe3"
+  }
+]
