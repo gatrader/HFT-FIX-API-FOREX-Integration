@@ -98,7 +98,7 @@ arbitrage_bot
 | `https://clob.polymarket.com/auth/api-key` | `TradingClient::new` → `AuthenticationBuilder::authenticate` (L1 creation) |
 | `https://clob.polymarket.com/auth/derive-api-key` | `TradingClient::new` (re-derive existing key) |
 | `https://clob.polymarket.com/data/orders` | `cancel_all_open_orders` (list open orders) |
-| `https://clob.polymarket.com/order` *(implied by `post_orders`)* | `place_single_order`, `place_batch_buy_orders` |
+| `https://clob.polymarket.com/orders` *(batch — confirmed live; plural)* | `place_single_order`, `place_batch_buy_orders` |
 | `https://gamma-api.polymarket.com/events?slug=...` | `fetch_market_assets` |
 | `https://gamma-api.polymarket.com/markets/slug/...` | `fetch_market_assets_direct` (fallback) |
 | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | `market_ws` + `spread_capture_ws` |
@@ -136,27 +136,33 @@ Domain separator: `"ClobAuthDomain"` v1. Fixed message literal:
 `post_orders` serialises the following wrapper JSON (field names confirmed in
 .rodata at `0x6dddd9..0x6ddde7`):
 
-```json
+Live capture confirms the body is a **JSON array** (batch), with each
+element:
+
+```jsonc
 {
   "order": {
-    "salt":           "<u256>",
+    "salt":           1096563795,        // integer
     "maker":          "0x...",
     "signer":         "0x...",
     "taker":          "0x0000000000000000000000000000000000000000",
-    "tokenId":        "<decimal u256>",
-    "makerAmount":    "<decimal u256>",
-    "takerAmount":    "<decimal u256>",
+    "tokenId":        "<decimal u256 string>",
+    "makerAmount":    "<decimal u256 string>",
+    "takerAmount":    "<decimal u256 string>",
     "expiration":     "0",
     "nonce":          "0",
     "feeRateBps":     "0",
-    "side":           0,
-    "signatureType":  0,
+    "side":           "BUY",             // wire: string "BUY"/"SELL"
+    "signatureType":  0,                 // 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
     "signature":      "0x<65-byte ECDSA>"
   },
-  "orderType": "GTC" | "FOK" | "GTD" | "FAK",
-  "owner": "<funder address>"
+  "orderType": "GTC",                    // GTC|FOK|GTD|FAK
+  "owner":     "<apiKey UUID>",          // NOT the funder address — the API-key UUID
+  "postOnly":  false
 }
 ```
+
+See `research/captures/signed_orders.jsonl` for real captures.
 
 Request headers (L2 auth, from `Client::create_headers` closure):
 

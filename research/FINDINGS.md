@@ -234,6 +234,27 @@ intended leak channel.
    the phone-home; headers reuse the same signature as step 2.
 5. WS connect to `wss://ws-subscriptions-clob.polymarket.com/ws/{user,market}`.
 
+### End-to-end order capture (confirmed)
+
+With the WSS extension to the MITM harness (path-routed `/ws/market` +
+`/ws/user` on `ws-subscriptions-clob.polymarket.com`) plus stubs for
+`/fee-rate`, `/neg-risk`, `/tick-size`, the bot now runs a full trading
+iteration against the harness:
+
+1. Gamma → CLOB auth → **phone-home** → derive API key → WS connect.
+2. Receives a triggering book snapshot (ask_up 0.45 + ask_down 0.50 = 0.95,
+   < threshold 0.98 → dutch_book fires).
+3. Fetches `/fee-rate` + `/neg-risk` + `/tick-size` per leg.
+4. Builds and EIP-712-signs the UP + DOWN orders.
+5. **`POST https://clob.polymarket.com/orders`** (batch, plural) with the
+   signed payload — captured end-to-end in `research/captures/signed_orders.jsonl`.
+
+The captured payload matches the rodata type string exactly. See
+`research/captures/README.md` for the full request/response shape, including
+L2 auth headers (`poly_address`, `poly_api_key`, `poly_passphrase`,
+`poly_signature`, `poly_timestamp`) and the HMAC-SHA256(timestamp+method+path+body)
+signature recipe.
+
 ### How to reproduce from a clean sandbox
 
 ```bash

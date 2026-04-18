@@ -23,7 +23,7 @@ openssl req -x509 -new -nodes -key ca.key -sha256 -days 3650 \
 
 # 2. Server cert with SAN covering every host we'll intercept
 cat > srv.ext <<'EOF'
-subjectAltName=DNS:gabagool22.com,DNS:gamma-api.polymarket.com,DNS:clob.polymarket.com
+subjectAltName=DNS:gabagool22.com,DNS:gamma-api.polymarket.com,DNS:clob.polymarket.com,DNS:ws-subscriptions-clob.polymarket.com
 basicConstraints=CA:FALSE
 EOF
 
@@ -37,7 +37,7 @@ cp ca.crt /usr/local/share/ca-certificates/localmitm.crt
 update-ca-certificates >/dev/null
 
 # 4. Redirect target hosts to localhost
-for H in gabagool22.com gamma-api.polymarket.com clob.polymarket.com; do
+for H in gabagool22.com gamma-api.polymarket.com clob.polymarket.com ws-subscriptions-clob.polymarket.com; do
     grep -q "$H" /etc/hosts || echo "127.0.0.1 $H" >> /etc/hosts
 done
 
