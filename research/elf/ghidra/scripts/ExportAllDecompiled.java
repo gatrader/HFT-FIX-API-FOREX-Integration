@@ -58,8 +58,12 @@ public class ExportAllDecompiled extends GhidraScript {
             if (c == null || c.isEmpty()) continue;
 
             String safe = name.replaceAll("[^A-Za-z0-9_]+", "_");
-            if (safe.length() > 200) safe = safe.substring(0, 200);
-            File out = new File(outDir, safe + ".c");
+            if (safe.length() > 180) safe = safe.substring(0, 180);
+            // Append entry address to avoid name collisions between
+            // distinct closures/generic instantiations that sanitise to
+            // the same string.
+            String addr = f.getEntryPoint().toString();
+            File out = new File(outDir, safe + "__" + addr + ".c");
             try (PrintWriter w = new PrintWriter(new FileWriter(out))) {
                 w.println("// " + name);
                 w.println("// entry = " + f.getEntryPoint());
