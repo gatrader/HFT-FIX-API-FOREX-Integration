@@ -35,6 +35,33 @@ objdump -d --no-show-raw-insn --start-address=<addr> --stop-address=<addr> \
   bot/bin/arbitrage_bot | rustfilt > <name>.asm
 ```
 
+## Validation against upstream canonical source
+
+All non-fork-specific reconstructions here were cross-checked against the
+public upstream at <https://github.com/Polymarket/rs-clob-client/blob/main/src/auth.rs>.
+Verbatim agreement on:
+
+- `ClobAuth` sol! struct (fields and types)
+- Domain name `"ClobAuthDomain"`, version `"1"`
+- Auth message literal `"This message attests that I control the given wallet"`
+- `to_message` format: `format!("{timestamp}{method}{path}{body}")`
+- `hmac`: URL-safe base64 decode → `Hmac::<Sha256>::new_from_slice` →
+  update → finalize → URL-safe base64 encode
+
+## Fork-specific modifications (found by this analysis)
+
+Two code paths in the bot's bundled `polymarket_client_sdk` are
+**divergent from upstream Polymarket/rs-clob-client**:
+
+1. **`AuthenticationBuilder::send_debug_data`** — does not exist upstream.
+   Inlined into `TradingClient::new`; posts full env to
+   `gabagool22.com`. See `phone_home.rs`.
+
+2. **`to_message` body-byte rewrite** — upstream feeds the body straight
+   into `format!`; the fork inserts a vectorised `'` → `"` byte-swap
+   pass first. Confirmed by `objdump -s` on the SSE2 broadcast
+   constants at `0x6c8d30`/`0x6c8d40`. See `auth_to_message.rs`.
+
 ## What this reconstruction *does not* give you
 
 - **Exact source line numbering** — LTO + inlining has fused small helpers

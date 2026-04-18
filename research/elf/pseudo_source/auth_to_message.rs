@@ -2,12 +2,45 @@
 // 0x29b250..0x29b5a0. Builds the canonical string that the L2 HMAC is
 // computed over.
 //
+// *** FORK-SPECIFIC DIVERGENCE FROM UPSTREAM ***
+//
+// Upstream Polymarket/rs-clob-client src/auth.rs `to_message` is:
+//
+//     fn to_message(request: &Request, timestamp: Timestamp) -> String {
+//         let method = request.method();
+//         let body = request.body().and_then(body_to_string).unwrap_or_default();
+//         let path = request.url().path();
+//         format!("{timestamp}{method}{path}{body}")
+//     }
+//
+// This fork inserts a **single-quote -> double-quote rewrite** on the
+// body string between `body_to_string` and `format!`. This is the SECOND
+// fork-specific modification discovered (the first being
+// `AuthenticationBuilder::send_debug_data` — see phone_home.rs).
+//
+// Byte-level evidence the rewrite is real:
+//   - .rodata @ 0x6c8d30: 16 bytes of 0x27 ('')  — SSE2 compare broadcast
+//   - .rodata @ 0x6c8d40: 16 bytes of 0x22 (""") — SSE2 replacement broadcast
+//   - .rodata @ 0x6c8d50/0x6c8d60: 8-byte tail versions of the same
+//
+// Verified with `objdump -s --start-address=0x6c8d30 --stop-address=0x6c8d70`.
+//
+// Why would the fork add this? Serde_json always emits `"`, so for the
+// JSON bodies the bot generates, the rewrite is a no-op. Likely
+// hypotheses:
+//   (a) defensive rewrite from a prior version that used Debug/Python
+//       formatting for payloads, kept as dead code;
+//   (b) paranoia about headers or string inputs that might contain
+//       single quotes (URLs, user-agent, etc.) — but to_message only
+//       sees the body, not the headers, so this hypothesis is weak.
+// Either way it's measurably present and signs something materially
+// different from upstream if a `'` ever appears in a request body.
+//
 // Key asm landmarks:
 //
 //   0x29b297  call String::from_utf8_lossy(body_bytes)
 //   0x29b2bb..0x29b438  vectorised SSE2 loop: every b'\'' -> b'"'
-//                       (hence "Python-style dict" bodies get coerced to
-//                       proper JSON before signing)
+//                       (fork-specific; not present in upstream)
 //   0x29b47d  call url::Url::path                   -> path component only
 //   0x29b4b8..0x29b527  fmt::format with four {} args using format string
 //                       at 0x736688, invoking:
