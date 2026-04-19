@@ -1018,3 +1018,76 @@ stdout/file), revert the first patch and instead hook a
 call). 16 bytes free at `0xe28b0..0xe28c0` if the simulation
 print code is dead-stripped.
 
+## 19. Correction — cfg lives at run_side_capture state+0x48 (not +0x60)
+
+Earlier (§17) I wrote that cfg is at `state+0x60` inside
+`run_side_capture`. That was wrong. Fresh trace of the actual
+callsite inside `tokio::Core<T,S>::poll` at `0xd9b00..0xd9c22`:
+
+```
+d9bce: mov  rdx, [rbx+0x60]            ; rbx = Core<spread_future>;
+                                        ; +0x60 holds the 8-byte cfg ptr
+d9bc3: lea  rax, [rbx+0x18]            ; captures base in Core
+d9bd2..d9be9: 3 × 16-byte movups copy captures rbx+0x18..0x58
+              → destination rbx+0x68..0xa8 (inner future state)
+d9c02: mov  [rbx+0xb0], rdx            ; store cfg into inner state
+d9c16: lea  r12, [rbx+0x68]            ; r12 = &inner_state
+d9c1a: mov  rdi, r12
+d9c1d: call run_side_capture           ; (&mut inner_state)
+```
+
+Inner-state base is `rbx+0x68`, so `cfg` written at `rbx+0xb0`
+lands at inner-state offset `0xb0 - 0x68 = 0x48`. Inside
+`run_side_capture`, `mov rcx, [self+0x48]` yields the cfg pointer,
+and all `[rcx+N]` dereferences match the Arc<BotConfig> layout:
+
+- `[rcx+0x10]` → BotConfig+0x00  (first f64, probably target_spread)
+- `[rcx+0x18]` → BotConfig+0x08
+- `[rcx+0x60]` → BotConfig+0x50  (max_buy_order_size; compared to 5.0 at 0xdabff)
+
+The 8-byte pointer width + no `lock incq` on the transfer path +
+`drop_in_place` showing `lock decq` on the destination field
+collectively confirm: **cfg is `Arc<BotConfig>` throughout**, moved
+(not cloned) from the outer future's capture slot into the inner
+future's state.
+
+## 20. post_orders state-0 body — URL construction and HTTP POST
+
+Mangled symbol name confirms the type:
+`polymarket_client_sdk::clob::client::Client<Authenticated<K>>::post_orders`.
+
+State-0 (0xd0f28..0xd1038):
+
+```
+d0f28: movw $0, [rsi+0x149]                ; clear state flags
+d0f31: mov  rax, [rsi+0x18]                ; load self (Client) via state capture
+d0f48: mov  r14, [rax]                     ; deref: r14 = &Client
+d0f4b: movabs rax, 0x0202020202020202
+d0f55: mov  [rsp+0x550], rax               ; 8 bytes of 0x02
+d0f5d: movaps xmm0, [rip + 0x6c8690]       ; 16 bytes of 0x02 from rodata
+d0f64: movaps [rsp+0x540], xmm0            ; together: 24-byte 0x02 buffer
+d0f97: lea  rax, [rip + 0x867df0]          ; .data.rel.ro — fmt args table
+d0fa6: movq $0x2, [rsp+0x208]              ; fmt_args count = 2
+d0fea: call alloc::fmt::format::format_inner   ; URL = format!("{}/{orders}", base, "orders")
+d1014: mov  rsi, [r14+0x128]               ; Client->http_client (reqwest::Client)
+d1033: call reqwest::async_impl::Client::request   ; POST request builder
+```
+
+No conditional branch, no bool test, no flag poll from entry to
+`Client::request`. Confirms §16: once `post_orders` is entered, the
+HTTP request is built unconditionally.
+
+The URL format table at `.data.rel.ro:0x867df0` references rodata
+string "orders" at `0x6d8ce4` (len 6) as the second format arg. The
+first arg is the Client's base URL field (loaded from `[r14+...]`
+via the format machinery; exact offset unfolded inside
+`format_inner`). This means: **swapping the base URL in the
+TradingClient config re-routes every order POST** — useful if you
+want to aim it at a local mitmproxy for capture/replay.
+
+The 24 bytes of 0x02 at `[rsp+0x540..0x558]` appear to be a
+pre-filled request header buffer or a fixed Order-protocol
+constant (possibly a signing-version byte repeated — Polymarket's
+Gnosis-Safe order signing uses specific byte patterns). Needs
+deeper trace to confirm; not relevant to the kill-switch plan.
+
