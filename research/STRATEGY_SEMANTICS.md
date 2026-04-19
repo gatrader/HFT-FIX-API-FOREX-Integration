@@ -763,12 +763,25 @@ reqwest-rbx point to different futures).
 
 The actual no-network gate (i.e. the place where the bot decides
 "don't submit this order to Polymarket") lives inside
-`TradingClient::place_single_order` (0x0e1a10) and/or
-`place_batch_buy_orders` (0x0c5390). The dry-run side path emits
-log messages "Fallback timer (s) expired, simulating BUY fill"
-(rodata 0x6d9ebd) suffixed with " DRY" (rodata 0x6d9e9f) — it
-short-circuits the order-place call and starts a fallback timer
-that synthesises a fill event after a fixed delay. Pin TBD.
+`TradingClient::place_single_order` (0x0e1a10) and/or the
+emitter cluster inside `run_side_capture` at 0x0dafa7..0x0db09f.
+The dry-run side path emits log messages "Fallback timer (s)
+expired, simulating BUY fill" (rodata 0x6d9ebd) — the " DRY"
+suffix at 0x6d9e9f is baked directly into the format string, so
+the emission of this message is itself conditional on dry_run.
+
+A nearby run_side_capture runtime flag at `state+0x25c` (written
+by `movb $0x1,0x25c(%rbx)` at 0x0dc901 and reset by
+`movb $0x0,0x25c(%rbx)` at 0x0dca22, then tested at 0x0dcaf4
+as `testb $0x1,0x25c(%rbx); jne ...`) is **NOT** the dry_run
+mirror — it is a per-cycle "order pending" flag that gates
+whether to release a RwLock write on the pending-order map.
+
+The true dry_run runtime gate is likely derived via a cmovne /
+test pattern on a state byte loaded just before the call to
+`polymarket_client_sdk::clob::Client::post_order`. Pin is still
+TBD; for a clone, set `dry_run = false` in config and leave the
+gate's condition dead — no behavioural change.
 
 ## 13. Summary: "bypass dangerous parts" checklist
 
