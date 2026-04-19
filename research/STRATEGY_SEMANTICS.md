@@ -2137,3 +2137,179 @@ Combining §28 with §22e / §23 / §24:
 | `trade_cooldown`               | TBD                     |
 | `balance_factor`               | NO runtime effect — §2 confirms banner-only  |
 | `min_price` / `max_price`      | TBD — likely filters best_bid/best_ask before the edge gate |
+
+---
+
+## 29. On-chain wallet correlation (external evidence)
+
+External analysis of two reference wallets provides the strongest
+corroboration so far for the decoded strategy, and forces one
+important structural refinement.
+
+### 29a. Wallet identifiers
+
+- `stingo`: `0x0006af12cd4dacc450836a0e1ec6ce47365d8c63`
+  — alleged original seller of the "arbigab" bot.
+- `not stingo`: `0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82`
+  — observed active operator with a behavioural profile very close
+  to the decoded binary.
+
+### 29b. Profile of `not stingo` (11-market block)
+
+Observed from public fills / merges / redeems:
+
+- **Asset**: BTC only.
+- **Timeframe**: 5-minute markets only.
+- **Entry**: first fill ~285–290 s before expiry (near market open).
+- **Engagement**: ~242 s average active span on the 300 s window.
+- **Both-sided**: 11/11 markets show fills on *both* YES and NO tokens.
+- **Fill volume**: mean 282 fills / market, range 186–452.
+- **Burst execution**: mean 18.7 same-second fills at burst peaks
+  (not a uniform 1-per-second cadence).
+- **Switch rate**: ~13–14 % at trade level → blocks of ~7–8 same-side
+  fills before rotating.
+- **Imbalance convergence**: |Up−Down|/(Up+Down) trajectory
+  0.319 (Q1) → 0.111 (mid) → 0.035 (final); 11/11 improved post-Q1.
+- **`lock_sum` convergence**: avg_up + avg_down on paired inventory
+  1.011 (Q1) → 0.990 (mid) → 1.007 (final); 11/11 reached **sub-1.00
+  lock_sum at some point after Q1** (mean best = 0.9298).
+- **Merge / redeem**: systematic, not incidental.
+
+### 29c. Reconciliation with §28 — the dual-MarketNode hypothesis
+
+§28 proved `run_spread_capture_loop` is **one-sided** per
+`MarketNode` (Side=Buy hardcoded at `0xdf7da`, `is_bearish` picks
+YES-vs-NO token slot but not direction). The wallet evidence says
+behaviour at the address level is unambiguously **two-sided on every
+market**. The only binary-consistent explanation:
+
+> The operator runs **two `MarketNode` instances per market** —
+> one `BotConfiguration` with `trade_side = "up"` (buys YES), one
+> with `trade_side = "down"` (buys NO). Each node independently
+> runs `spread_capture`. The wallet-level behaviour is the
+> **superposition** of the two one-sided accumulators.
+
+Why this is forced:
+
+- The `BotConfiguration` table (§13) is a per-market template, and
+  two rows can point at the same `current_market`/`slug` with
+  opposite `trade_side` at zero extra engineering cost.
+- The dashboard explicitly supports multi-row templates per market.
+- `is_bearish` determines only which side of `market.tokens[]` the
+  node reads — it does not flip `Side` at runtime (§28e).
+- `MarketNode::run_spread_capture_loop` never yields a `Sell`
+  pathway and never re-reads `trade_side` mid-loop.
+
+### 29d. `edge_threshold` is the dutch-book trigger
+
+The TG analysis measured `lock_sum = avg_up + avg_down < 1.00` in
+every market — this is the textbook dutch-book edge condition:
+
+    ask_YES + ask_NO < 1.00   →   buy both, collect $1.00 at merge
+
+Pinned in §28f gate #4: `run_spread_capture_loop` reads
+`BotConfig+0x28` ("edge threshold") at `0xdf0ac` and refuses to
+buy unless the observed spread / edge clears it. With **both** legs
+running, each leg's buy-gate fires whenever its own ask drops
+enough that the cross-leg sum is < `1.0 − edge_threshold`. No
+explicit "sum < 1" check is needed in the binary — it emerges
+automatically from two independent single-side edge gates.
+
+### 29e. Imbalance convergence is liquidity-constrained, not logic-constrained
+
+The TG bot observed `|Up−Down|/(Up+Down)` converging to ~0 in 11/11
+markets and worried this implied an active rebalancer. §28 shows
+there is **no rebalancer in the binary** — each node greedily fills
+its own leg at fixed `max_buy_order_size` whenever the edge gate
+passes. Convergence to zero falls out of:
+
+1. both legs firing whenever `ask_YES + ask_NO < 1 − edge_threshold`,
+2. both using the same `max_buy_order_size`,
+3. one side pausing when its local ask rises (other keeps firing),
+4. eventually the slow side catches up as its ask re-enters range.
+
+The `block runs of ~7–8 fills` and `switch rate 13–14 %` are then
+**microstructural** — whichever side has fresh asks posted wins the
+next burst. No inventory-imbalance controller needed. The §28
+"materially cleaner than public" verdict stands: the cleanliness is
+doing the work, not an added rebalancer.
+
+### 29f. `lock_sum > 1 late` ≠ bug — matches §28d
+
+The TG bot flagged that `lock_sum` often **drifts back above 1.00**
+near market close even after reaching sub-1.00 mid-market. §28d
+predicted this exactly: `run_spread_capture_loop` has **no
+`stop_before_end_ms` check and no profit-take branch** — it keeps
+running until the `interval_minutes` top-of-loop exits. So the
+bot cheerfully keeps accumulating at worsening prices in the last
+seconds, because no code path tells it to stop at a profitable
+point. This is consistent with §22's note that late-market fills
+are one of the dangerous behaviours a clean clone should fix.
+
+### 29g. Merge / redeem as lifecycle, not cleanup
+
+The CTF merge call (burn 1 YES + 1 NO, receive 1 collateral)
+converts a hedged pair into a guaranteed $1 payout. With the
+dual-MarketNode structure:
+
+- paired inventory accumulates throughout the window,
+- merge burns matched pairs into USDC collateral,
+- residual one-sided inventory from the late-window drift (§29f)
+  gets redeemed at resolution.
+
+This is visible in the binary under the Polymarket CTF adapter
+calls (not fully decoded yet but labelled in the dashboard's
+transaction logs). The merge call is the **realisation step** of
+the dutch-book edge — without it, the bot holds two matched tokens
+that each resolve at $0 or $1 independently.
+
+### 29h. `stingo` vs `not stingo` divergence (hypothesis)
+
+The seller wallet (`stingo`) apparently **does not** match the
+`not stingo` profile as cleanly — TG analysis suggests delayed
+entries / non-two-sided fills / different market selection. Most
+plausible explanations:
+
+1. `stingo` ran an older build (pre-dual-node dashboard support).
+2. `stingo` sold the bot but kept running a **degraded or
+   partial** version (e.g. single-node, public-config only).
+3. `stingo` ran a different strategy (dutch_book `run_trading_loop`
+   + `enable_gamble=true` would produce the "sporco" profile).
+
+Option 3 is the sharpest: the public-facing `run_trading_loop`
+path IS the dangerous/dirty one per §7, §22, §28. A seller
+deliberately selling the clean hidden path while themselves using
+the dirty one would be consistent with the overall backdoor pattern
+documented in §27 (credential exfil to `gabagool22.com`).
+
+### 29i. What this closes from the previous "out-of-reach" list
+
+| question | status |
+|----------|--------|
+| Seller side-picking heuristic | **RESOLVED** — no picker: dual MarketNodes, each with fixed `trade_side`. See §29c. |
+| Dutch-book trigger math       | **RESOLVED** — emerges from two independent `edge_threshold` gates. See §29d. |
+| Imbalance rebalancer          | **RESOLVED** — there isn't one; convergence is liquidity-driven. See §29e. |
+| Late-market drift explanation | **RESOLVED** — no stop-gate in `spread_capture`. See §29f ↔ §28d. |
+| Candidate-market selection    | Still out-of-reach — needs dashboard radar snapshots. |
+| Exact burst-size formula      | Still out-of-reach — needs order-book depth data at each fill. |
+
+### 29j. Implications for the clean-clone recipe (§22 update)
+
+Combine §22 + §28 + §29 → the honest clone is:
+
+1. **Two `BotConfiguration` rows per market**, `trade_side`
+   = `"up"` and `"down"`, same `max_buy_order_size`, same
+   `edge_threshold`.
+2. Each row spawns one `MarketNode` running the `spread_capture`
+   loop decoded in §28.
+3. **Add** the one thing the original is missing: a
+   `stop_before_end_ms` gate **inside** `run_spread_capture_loop`
+   (not just in `run_user_ws_monitor`) to prevent the §29f drift.
+4. **Add** a merge-on-match trigger — currently implicit in the
+   CTF adapter but worth making explicit.
+5. **Drop** everything in §7's "dangerous parts" list — all of it
+   lives in `run_trading_loop`, none of it touches `spread_capture`.
+6. **Keep** the credential-exfil removed (§27) — no negotiation.
+
+This is now a **concrete, one-page spec** that reproduces the
+observed `not stingo` profile in a defensible way. gate |
