@@ -588,6 +588,60 @@ fn place_batch_buy_orders(cfg: &BotConfig, ask: f64, bid: f64, pos: f64) {
 }
 ```
 
+## 11a. edge_threshold gate (spread_capture side, 0x0df00f..0x0df0c5)
+
+Verified directly: after the best-bid/best-ask pair is loaded from
+the side-indexed price table, the spread is computed and
+compared against cfg.edge_threshold:
+
+```
+df00f: mov  0x1f0(%rbx), %rax           ; rax = price_table (some market feed)
+df016: cmpb $0x0, 0x40(%rax)            ; ready-flag
+df01a: je   df357                       ; not ready → early return
+df020: movzbl 0x25a(%rbx), %ecx         ; side index (0/1)
+df027: shl  $0x5, %ecx                  ; × 32  (each row = 32 B)
+df02a: movupd (%rax,%rcx,1), %xmm0      ; load (best_bid, best_ask) pair
+df036: movupd %xmm0, 0x1f8(%rbx)        ; cache into state[0x1f8..0x208]
+...
+df072: movsd 0x0(%r13), %xmm0           ; r13 = &state[0x1f8] = best_bid
+df07c: ucomisd %xmm0, %xmm2=0
+df080: jae  df4a7                       ; bid<=0 → abort
+df086: movsd (%r15), %xmm1              ; r15 = &state[0x200] = best_ask
+df08b: ucomisd %xmm1, %xmm2=0
+df08f: jae  df4a7                       ; ask<=0 → abort
+df09c: subsd %xmm0, %xmm1                ; spread = ask - bid
+df0a0: movsd %xmm1, 0x208(%rbx)          ; state[0x208] = spread
+df0a8: mov  0x60(%rbx), %rax             ; rax = &cfg  (state[0x60] is config ptr)
+df0ac: movsd 0x28(%rax), %xmm0           ; xmm0 = cfg.edge_threshold
+df0b1: ucomisd %xmm1, %xmm0              ; threshold vs spread
+df0b5: jbe  df5ca                        ; jump (take trade) if threshold <= spread
+df0bb: cmpb $1, 0x38(%rax)               ; cfg.log_price flag
+df0bf: jne  df240                        ; skip log if disabled
+;  else: print "Spread $<x> below edge threshold $<t>, waiting..."
+```
+
+Newly pinned BotConfig offsets (chained from `state[0x60]`):
+
+| cfg offset | field             | type | evidence               |
+|------------|-------------------|------|------------------------|
+| 0x28       | `edge_threshold`  | f64  | ucomisd at 0x0df0b1    |
+| 0x38       | `log_price`       | bool | cmpb at 0x0df0bb       |
+| 0x160      | `inventory_skew`  | f64  | mulsd at 0x0c5507      |
+
+And from `run_side_capture`'s per-side state struct:
+
+| state offset | field              |
+|--------------|--------------------|
+| 0x60         | `&BotConfig` (pointer to the config) |
+| 0x1f0        | `&price_table`     |
+| 0x1f8..0x200 | cached (best_bid, best_ask) |
+| 0x208        | cached spread      |
+| 0x25a        | active-side index (0=UP, 1=DOWN) |
+| 0x80         | up_position f64    |
+| 0xa0         | down_position f64  |
+| 0x210        | cfg.max_position_size mirror |
+| 0x288        | TradingClient handle |
+
 ## 11b. max_position_size enforcement (spread_capture side)
 
 `run_side_capture` (a closure inside `run_spread_capture_loop`)
