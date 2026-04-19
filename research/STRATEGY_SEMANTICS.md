@@ -311,9 +311,12 @@ direct LEA scan misses it (hence no `LEA 0x868cf0` hits).
 
 - **spread_capture** (strategy=="spread_capture"): runs
   `run_spread_capture_loop` with an `is_bearish` bool derived from
-  `trade_side`. Acts more like a traditional market-maker
-  quoting both sides, with per-side logic that depends on
-  `is_bearish` (directional lean).
+  `trade_side`. **Corrected by §28**: this is NOT a two-sided
+  market-maker. It is a one-sided buy-only accumulator of a single
+  outcome token (YES when `is_bearish=false`, NO when
+  `is_bearish=true`). The `Side` byte is hardcoded to `Buy` at
+  `0xdf7da`; the bool only selects which asset slot is accumulated,
+  never the buy/sell direction. See §28b.
 
 The third-party log literals referencing "edge_threshold", "Spread
 detected!", "Fallback timer expired" etc. all live in the
@@ -1477,7 +1480,16 @@ with the default-fill sources:
 | 0xb0             | target_spread                | f64       | 0.01    |
 | 0x160            | inventory_skew               | f64       | 0.0     |
 
-## 24. target_spread — PINNED at BotConfig+0xb0, consumed in run_side_capture
+## 24. target_spread — PINNED at BotConfig+0xb0 (DEAD CAPTURE — see §28c)
+
+> **Correction**: the claim below that target_spread is "consumed in
+> run_side_capture" is **wrong**. Agent audit in §28c proves
+> target_spread is captured-by-value into the sub-future state at
+> `self+0x28` but **never read**. The active gate at `0xdf0ac` that
+> this section attributed to target_spread is actually a read of
+> BotConfig+0x28 = `edge_threshold`. Keeping §24's derivation
+> (offset 0xb0 is correct and useful for cloners) but flagging the
+> "real knob" conclusion as incorrect.
 
 Resolves the §3-old / §22e open question on runtime use.
 
@@ -1884,3 +1896,244 @@ the size-randomiser, and the §21 exfil. With §27, the list is:
 After those 8 edits, the tool runs the same strategy without
 the C2 surveillance, the wallet-key theft, the manipulation
 layers, and the trivially-exploitable dashboard routes.
+
+## 28. Hidden-loop final decode — corrections to §6 and §24
+
+Parallel agent audits of `run_spread_capture_loop` (0x97950) and
+`run_side_capture` (0xd9e90) forced **three corrections** to the
+earlier hypothesised semantics. The hidden strategy is simpler,
+narrower, and cleaner than the dutch_book path — and some
+knobs previously assumed live are dead.
+
+### 28a. `enable_gamble` is dutch_book-only (dead in spread_capture)
+
+Propagation evidence for the reducer's runtime byte at
+`run_trading_loop::self+0x150`:
+
+```
+0x9f04e: movupd 0xa0(%r15), %xmm0     ; load BotConfig+0xa0..0xb0
+0x9f057: movupd %xmm0, 0x150(%r15)    ; store into self+0x150
+         (triplicated at 0xf7447, 0x11d337 per wallet monomorph)
+0xc1a1f: cmpb $0x0, 0x150(%rcx)       ; §10 gate
+0xc1aa3: addpd %xmm0, %xmm1           ; the only `addpd` in .text
+                                      ; that touches bid-pair
+```
+
+**`addpd` count across the entire `.text`: three total.** One at
+`0xc1aa3` (reducer). The other two at `0x48b361` and `0x48b3bd`
+are inside `strsim::jaro` (third-party crate — unrelated).
+
+**No equivalent mirror copy exists for spread_capture.**
+`run_single_market` (all three monomorphs 0x89670, 0xe6150,
+0x10c040) performs no byte or SSE read from `0xa0(%state)` into
+any spread_capture sub-future. Inside `run_spread_capture_loop`
+and `run_side_capture`, not a single `cmpb $0x0, 0x150(%reg)` or
+`testb` on `0xa0(%state)` exists.
+
+**Reducer log string `"🎲 Spread reducer triggered!"`** at
+`0x6d9823`, format-args metadata at `0x6d9870`. The **only** LEA
+to `0x6d9870` in the whole binary is at `0xc1b23` (inside
+run_trading_loop). Zero hits from 0x97950..0x9e38d or
+0xd9e90..0xe197c.
+
+**Submit-path segregation confirms §15's pin**:
+
+| call target                          | call sites                                   |
+|--------------------------------------|----------------------------------------------|
+| `place_batch_buy_orders` @ 0xc5390   | only `0xc1df0` (run_trading_loop)            |
+| `place_single_order` @ 0xe1a10       | `0xde754` + `0xdf7fd` (run_side_capture)     |
+
+So the §3 two-roll `gen_range` size-randomisation (0xc7931 /
+0xc795e, inside place_batch_buy_orders) is also **dutch_book-only**.
+spread_capture posts single orders at deterministic sizes.
+
+**30-second answer**: in `strategy=="spread_capture"`, flipping
+`enable_gamble=true` or `false` produces **zero observable
+difference**. Dead weight. Leave it `false` in clean clones.
+
+### 28b. `run_spread_capture_loop` is a ONE-SIDED BUY-ONLY accumulator
+
+§6 originally framed this as "market-maker quoting both sides."
+That is **wrong.** Pinned evidence:
+
+```
+0xdf7da: mov WORD PTR [rbx+0x2eb], 0x100
+         ; writes Side=Buy (0x00) and OrderType byte (0x01)
+         ; the Side byte is HARDCODED — no conditional store
+         ; of 0x01 to [rbx+0x2eb] exists in 0xd9e90..0xe197c
+0xe08ea..0xe08ef: literal bytes 0x62 0x75 0x79  = "buy"
+         ; written into the order-tag heap string
+         ; no "sell" literal appears in the function
+0xe01ae: call cancel_orders
+         ; operates on Vec<OrderId>, NOT a sell replacement
+```
+
+Semantics: each cycle, the loop picks a side (YES or NO token —
+see §28e) and **buys more of it** until `max_position_size` caps
+the position. Exits are driven by cancellations from outside the
+loop, not by the loop itself. The "spread_capture" name is
+misleading — there is no two-sided book quoting.
+
+### 28c. `target_spread` is a dead capture (correction to §24)
+
+§24 claimed target_spread is captured into the sub-future at
+`self+0x28` and consumed as a gate. The "consumed" claim is
+**incorrect.**
+
+Re-audit trace:
+
+```
+0x8bd1d: movsd xmm0, [rax+0xc0]   ; read BotConfig+0xb0 target_spread
+0x97b34: movsd [rbx+0x28], xmm0   ; store into sub-future self+0x28
+                                   ; (YES, captured by value)
+
+; Inside run_side_capture (0xd9e90..0xe197c):
+grep -c 'mov.*0x28\(%rbp\)'    →  reads exist
+grep -c 'mov.*0x28\(%rsp\)'    →  reads exist
+grep -c 'ucomisd.*0x28(%...)'  →  0 inside the sub-future slot
+
+; The ONE read that looks like target_spread usage:
+0xdf0ac: mov 0x60(%rbx), %rax     ; rax = &BotConfig  (§11a)
+0xdf0b1: movsd xmm0, [rax+0x28]   ; xmm0 = edge_threshold (BotConfig+0x28)
+0xdf0b5: ucomisd xmm1, xmm0       ; spread vs edge_threshold
+                                   ; this is the §11a edge gate — NOT target_spread
+```
+
+There is no `[rbx+0x28]` or `[self+0x28]` read that treats the
+value as an f64 comparand anywhere in the hidden loop. The field
+is captured, propagated through the tokio state machine, and
+**never consulted.** Vestigial — probably a planned feature that
+didn't ship, or a refactor leftover.
+
+**Clean-clone implication**: target_spread can be dropped from
+the config entirely. Setting it doesn't affect bot behavior.
+
+### 28d. No time-left stop inside `run_spread_capture_loop`
+
+`stop_before_end_ms` is a `BotConfig` field documented in §22e.
+The "Only Xs until window end, stopping early" log string lives
+at `0x6d9b07`. The **only** LEA to that address is at `0xb6088`
+— inside `run_user_ws_monitor` (0xb5f50..0xc020f), a different
+function altogether.
+
+- No `chrono::Utc::now()` call inside 0x97950..0x9e38d or
+  0xd9e90..0xe197c
+- No `SystemTime` reference
+- No "window_end" / "stop_before_end_ms" consumer in the loop
+- `utils::now_str` (0x170e20) is called from `0xe1a9f` only, for
+  the `[SIM]` log-line timestamp
+
+So the hidden loop has **no graceful-shutdown gate**. It runs
+until cancelled from above (by `main`'s two-shot sequencing per
+§25) or until the WS connection dies. The `stop_before_end_ms`
+field is only honored by `run_trading_loop` (dutch_book).
+
+### 28e. `is_bearish` picks the TOKEN, not the direction
+
+§6's original framing treated `is_bearish` as a directional lean.
+The actual runtime effect is narrower:
+
+- `is_bearish` (derived from `trade_side.to_lowercase() ∈
+  {"no","down"}`, see §0) is passed as an arg to
+  `run_spread_capture_loop`.
+- At `0xd9ede`, the spawning code reads it from `+0x258` of the
+  parent arg pack and stores it as a byte at `rbx+0x25a` in the
+  run_side_capture state.
+- Three token-slot selectors then use that byte:
+
+```
+0xdefef: movzbl 0x25a(%rbx), %eax
+         shl $5, %eax           ; × 32 (each asset row = 32 B)
+         ; used to offset into the YES/NO asset metadata table
+0xe04a9: (same pattern)
+0xe071a: (same pattern)
+0xdf5d7: (same pattern, but indexing the position-slot pair)
+```
+
+So `is_bearish` selects **which 32-byte asset record** (YES vs NO
+outcome token) to accumulate, and **which position slot**
+(state+0x80 for UP vs state+0xa0 for DOWN, per §11b) the
+max_position_size gate reads. **`Side` is always Buy regardless.**
+
+| `trade_side` | `is_bearish` | token bought | position slot checked |
+|--------------|--------------|--------------|----------------------|
+| `"up"`/`"yes"`/""/anything-else | false | YES outcome | `state+0x80` (UP)   |
+| `"down"`/`"no"`                 | true  | NO outcome  | `state+0xa0` (DOWN) |
+
+### 28f. Buy-gate checklist (pinned, replaces the §6 / §11a sketches)
+
+Each book tick inside `run_side_capture` evaluates in order:
+
+| # | addr     | gate                                                         |
+|---|----------|--------------------------------------------------------------|
+| 1 | 0xdf072  | `bid > 0`                                                    |
+| 2 | 0xdf086  | `ask > 0`                                                    |
+| 3 | 0xdf09c  | compute `spread = ask - bid`, cache at `rbx+0x208`           |
+| 4 | 0xdf0b1  | `edge_threshold ≤ spread` (else skip; log if `log_price`)    |
+| 5 | 0xdf5ca  | `get_position()` syscall                                     |
+| 6 | 0xdf5d7  | pick UP-or-DOWN position slot via `rbx+0x25a`                |
+| 7 | 0xdf5f0  | `position < max_position_size` (else skip)                   |
+| 8 | 0xdf7da  | write Side=Buy / OrderType to order tag                      |
+| 9 | 0xdf7fd  | call `place_single_order`                                    |
+|10 | 0xe1a8e  | **inside place_single_order**: if `size < 5.0`, log-sim only |
+|11 | 0xe1c13  | else: real CLOB POST                                         |
+
+### 28g. State-table stubs (jumptables located)
+
+Three jumptables found, all in `.rodata`:
+
+| jumptable VA | indexed by            | states decoded | notes                   |
+|--------------|------------------------|----------------|-------------------------|
+| `0x7cbe38`   | `BYTE [self+0x621]`    | 0..9 valid     | outer spread_capture loop; slots 10+ misalign |
+| `0x7cb914`   | `BYTE [self+0x259]`    | 0..6 valid     | side dispatcher; 13..27 misread |
+| `0x7cb9a0`   | `BYTE [self+0x40]`     | —              | inner closure dispatch  |
+
+The smaller-than-expected valid-state count (≤10 vs the ~28
+estimated from §0) suggests the loop is substantially simpler
+than run_trading_loop's 28-state machine. Consistent with the
+buy-only-accumulator framing: fewer message types, fewer
+stateful transitions.
+
+### 28h. Rolled-up verdict on the hidden strategy
+
+After §28a-g:
+
+- **What it does**: accumulate one side (YES or NO) of a
+  Polymarket outcome whenever `spread ≥ edge_threshold` and
+  `position < max_position_size`, at a fixed market-making size
+  (the `order_size` / `max_buy_order_size` dials).
+- **What it doesn't do**: quote both sides. Price-inflate.
+  Size-randomise. Gate on `target_spread`. Gate on
+  `stop_before_end_ms`. Read `enable_gamble`.
+- **Cleanliness differential**: the hidden strategy is
+  **materially cleaner than the public one**. No reducer, no
+  randomiser, no inflation. An ethically-cloned bot could keep
+  spread_capture largely as-is and discard most of §7's
+  "dangerous parts" list — those all sit on the dutch_book side.
+
+### 28i. Config-field liveness summary (spread_capture only)
+
+Combining §28 with §22e / §23 / §24:
+
+| field                          | live in spread_capture? |
+|--------------------------------|-------------------------|
+| `trade_side` → `is_bearish`    | YES — picks token slot  |
+| `edge_threshold`               | YES — §28f gate #4      |
+| `max_position_size`            | YES — §28f gate #7      |
+| `max_buy_order_size`           | YES — size of each buy  |
+| `log_price`                    | YES — §11a log gate     |
+| `interval_minutes`, `slug`, `symbol`, `current_market` | YES — market selection |
+| `cancel_orders_on_start`       | YES (§11c, loop-agnostic) |
+| `dry_run` (config bool)        | NO runtime effect — §15's 5.0 size gate is the real sim gate |
+| `enable_gamble`                | **NO — §28a**           |
+| `spread_reducer_value`         | **NO — §28a**           |
+| `spread_reducer_probability`   | **NO — §28a**           |
+| `target_spread`                | **NO — §28c (dead)**    |
+| `stop_before_end_ms`           | **NO — §28d**           |
+| `spread_threshold`             | TBD — name suggests live here, but no 0x?? offset pinned yet |
+| `order_size`                   | TBD — possibly distinct from max_buy_order_size |
+| `inventory_skew`               | NO in this loop — §3 is dutch_book-only (single-side, no delta skew) |
+| `refresh_interval_ms`          | TBD — no explicit `tokio::sleep` pin inside side_capture yet |
+| `trade_cooldown`               | TBD                     |
+| `balance_factor`               | NO runtime effect — §2 confirms banner-only  |
+| `min_price` / `max_price`      | TBD — likely filters best_bid/best_ask before the edge gate |
