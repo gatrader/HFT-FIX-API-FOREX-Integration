@@ -1213,3 +1213,200 @@ the rodata one-byte patch is the correct fix.
   as a disguise**. Any "dry_run" option in the config is
   cosmetic; the dangerous behaviour fires regardless.
 
+## 22. Strategy synthesis — what to actually copy
+
+Concise reconstruction distilled from §0-§21. This is the
+implementable spec for a clean re-write.
+
+### 22a. Top-level control flow
+
+```rust
+fn main() -> Result<()> {
+    let cfg = BotConfig::parse();            // clap + JSON merge
+    let client = TradingClient::new(&cfg);   // ⚠ §21 — remove exfil before running
+    run_single_market(cfg, client).await
+}
+
+async fn run_single_market(cfg: BotConfig, client: TradingClient) {
+    if cfg.cancel_orders_on_start {
+        client.cancel_all_open_orders().await;
+    }
+    match cfg.strategy.as_str() {
+        "spread_capture" => {
+            let is_bearish = matches!(
+                cfg.trade_side.to_lowercase().as_str(),
+                "no" | "down"
+            );
+            run_spread_capture_loop(cfg, client, is_bearish).await
+        }
+        _ /* "dutch_book" or "" */ => {
+            run_trading_loop(cfg, client).await
+        }
+    }
+}
+```
+
+### 22b. run_trading_loop (dutch_book) — market-making via batch buy
+
+Per-market websocket subscription → on each book update, compute
+quote ladder and spawn a `place_batch_buy_orders` task.
+
+```rust
+async fn run_trading_loop(cfg: BotConfig, client: TradingClient) {
+    let mut ws = polymarket_ws::subscribe(&cfg.current_market).await;
+    loop {
+        match ws.next().await {
+            Msg::Book(book) => {
+                if should_quote(&book, &cfg) {
+                    let orders = build_buy_ladder(&book, &cfg);
+                    tokio::spawn(client.place_batch_buy_orders(orders));
+                }
+            }
+            Msg::Trade(_) | Msg::PriceChange(_) => { /* update state */ }
+            Msg::Disconnect => break,
+        }
+        if past_stop_time(&cfg) { break; }
+    }
+}
+
+fn should_quote(book: &Book, cfg: &BotConfig) -> bool {
+    let spread = book.best_ask - book.best_bid;
+    spread > cfg.edge_threshold                                // §11a
+        && book.mid >= cfg.min_price && book.mid <= cfg.max_price
+        && position_within_bounds(cfg)                          // §11b
+}
+
+fn build_buy_ladder(book: &Book, cfg: &BotConfig) -> Vec<Order> {
+    let target = cfg.max_buy_order_size;                        // 5.0 default
+    let pos_f = current_position_factor();                      // -1..+1
+    let yes_target = (target + (book.ask - book.bid) * pos_f * 0.5)
+                         .clamp(0.0, 2.0 * target);
+    let no_target  = (target - (book.ask - book.bid) * pos_f * 0.5)
+                         .clamp(0.0, 2.0 * target);
+
+    // §3 — size randomisation is ALWAYS applied (no conditional found)
+    let mut rng = thread_rng();
+    let yes_size = (rng.gen_range(0.0..1.0) * yes_target).round();
+    let no_size  = (rng.gen_range(0.0..1.0) * no_target).round();
+
+    // §10 — spread-reducer price inflation, probability-gated
+    let inflate = !cfg.enable_gamble.is_empty()                 // §22d hypothesis
+        && rng.gen_range(0.0..1.0) < cfg.spread_reducer_probability;
+    let yes_px = if inflate { book.best_bid + cfg.spread_reducer_value }
+                 else       { book.best_bid };
+    let no_px  = if inflate { 1.0 - book.best_ask + cfg.spread_reducer_value }
+                 else       { 1.0 - book.best_ask };
+
+    vec![
+        Order::buy("YES", yes_px, yes_size),
+        Order::buy("NO",  no_px,  no_size),
+    ]
+}
+```
+
+### 22c. run_spread_capture_loop — buy both sides when wide
+
+Much simpler: `"Spread Capture Bot: BUY both sides when spread >
+threshold"` (banner). Each `run_side_capture` future handles one
+leg (YES/NO) and submits a single order via
+`place_single_order`.
+
+```rust
+async fn run_spread_capture_loop(cfg: BotConfig, client: TradingClient,
+                                  is_bearish: bool) {
+    let mut ws = polymarket_ws::subscribe(&cfg.current_market).await;
+    loop {
+        let book = ws.next_book().await;
+        let spread = book.best_ask - book.best_bid;
+        if spread > cfg.spread_threshold {
+            // run_side_capture is called INLINE via Core::poll (§19)
+            // not tokio::spawn — single-threaded sequential order flow
+            run_side_capture(&cfg, &client, &book,
+                             side_for_bearish(is_bearish)).await;
+        }
+    }
+}
+
+async fn run_side_capture(cfg: &BotConfig, client: &TradingClient,
+                          book: &Book, side: Side) {
+    let target = cfg.order_size.min(cfg.max_buy_order_size);   // §17 — 5.0 clamp at 0xdabff
+    let price  = price_for_side(book, side);
+    place_single_order(client, side, price, target).await;     // §15 — gated at 0xe1a8e
+}
+```
+
+### 22d. Working hypothesis: enable_gamble
+
+Evidence:
+- Type: String (deserialized via `String::deserialize`)
+- Default: `""` (empty)
+- Hidden from CLI (JSON-config-only)
+- No distinct value strings in rodata (no "on"/"off"/"always" etc)
+- Only rodata reference is the field-name itself at `0x6dc9e8`
+  inside the deserializer — no runtime code references the
+  `enable_gamble` string
+
+Working hypothesis: `enable_gamble` is checked as
+`!cfg.enable_gamble.is_empty()`. When non-empty it unlocks the
+**spread-reducer price inflation** and possibly the **size
+randomisation** pathways. The actual string value is opaque — it
+could be a label ("yes", "doit", anything) that only the operator
+sees; the runtime only cares whether it's empty.
+
+This is consistent with the "hidden feature flag" pattern
+typical of malware-adjacent code: the name + non-empty value
+becomes a poor-man's feature toggle that doesn't need a visible
+bool to avoid giving the feature away in `--help` output.
+
+### 22e. Config knobs & what they control (cheat-sheet)
+
+| field                       | unit    | effect                                          |
+|-----------------------------|---------|-------------------------------------------------|
+| strategy                    | string  | "dutch_book" (default) or "spread_capture"     |
+| symbol                      | string  | btc / eth / sol / xrp                           |
+| current_market              | bool    | use current market (skip next-market wait)      |
+| slug                        | string  | override symbol→slug mapping                    |
+| interval_minutes            | u32     | market interval (5 or 15)                       |
+| dry_run                     | bool    | §12a banner only — NOT a hot-path gate          |
+| max_buy_order_size          | f64     | base target per leg (default 5.0)               |
+| order_size                  | f64     | spread_capture per-order size                   |
+| spread_threshold            | f64     | spread_capture trigger (cents: 0.02 = 2c)       |
+| edge_threshold              | f64     | dutch_book quote trigger (§11a)                 |
+| max_position_size           | f64     | stop when \|position\| > this (§11b)            |
+| min_price / max_price       | f64     | price bounds (0..1)                             |
+| balance_factor              | f64     | 0-1 inventory skew intensity (§2)               |
+| inventory_skew              | f64     | position-weighted sizing multiplier             |
+| trade_cooldown              | u64     | ms between cancel & requote                     |
+| refresh_interval_ms         | u64     | ms between book refreshes                       |
+| stop_before_end_ms          | u64     | stop trading N ms before market close           |
+| cancel_orders_on_start      | bool    | §11c — cancel open orders at init               |
+| log_price                   | bool    | enable book-price logging                       |
+| target_spread               | f64     | spread_capture target spread                    |
+| trade_side                  | string  | "up"/"down" or "yes"/"no" (default "up")        |
+| enable_gamble               | string  | §22d — non-empty → enables spread_reducer      |
+| spread_reducer_value        | f64     | $ added to price when reducer fires (§10)       |
+| spread_reducer_probability  | f64     | 0-1 prob of firing reducer                      |
+| max_loss                    | f64     | unused in decoded paths (banner only?)          |
+
+### 22f. Minimum "clean clone" recipe
+
+To build your own version of this bot without the dangerous
+parts:
+
+1. Drop §21 exfil entirely — no `std::env::vars()` POST.
+2. Drop §10 spread-reducer — it's a price-inflation layer that
+   benefits the bot-operator at the market's expense.
+3. Drop §3 size randomisation — use deterministic `target` size.
+4. Keep §22b ladder + §11a edge gate + §11b position clamp.
+5. Keep §22c spread_capture loop as-is (it's honest).
+6. Use `dry_run` as a **real** gate in your own code — put the
+   branch at the top of `place_single_order` and
+   `place_batch_buy_orders`, not buried behind a `size < 5.0`
+   check.
+7. Log every outgoing order to disk; add a mitmproxy interstitial
+   for the first live test.
+
+That leaves you with an honest Polymarket market-maker + spread-
+capture bot that can be audited in ~400 LoC of Rust.
+
+
