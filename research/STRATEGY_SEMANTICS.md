@@ -29,7 +29,7 @@ main
 Both loop functions are Rust async state machines, lowered with LTO
 into opaque jumptables (28-ish states each). The dispatch byte lives
 at `self+0x71b` for run_trading_loop, indexed through the jumptable
-at `.rodata:0x6cb324`.
+at `.rodata:0x6cbb28` (see §14).
 
 ## 1. BotConfig default values (non-zero defaults from serde struct-tail)
 
@@ -789,3 +789,63 @@ For the clone:
 
 With those four edits, the bot runs the same strategy without
 the manipulative price-inflation and obfuscated-size layers.
+
+## 14. run_trading_loop async state table (28 states, jumptable at 0x6cbb28)
+
+Function entry 0x0f7330; dispatch at 0x0f7358:
+
+```
+f7358: movzbl 0x71b(%rdi),%eax               ; load state byte
+f735f: lea    0x6cbb28(%rip),%rcx            ; jumptable base
+f7366: movslq (%rcx,%rax,4),%rax             ; table[state] (i32, sign-extend)
+f736a: add    %rcx,%rax                      ; target = base + rel
+f7372: jmp    *%rax
+```
+
+Jumptable contents (28 entries, each a rel32 offset from the
+table base):
+
+| state | target    | role (inferred)                                |
+|-------|-----------|-----------------------------------------------|
+|   0   | 0xf7374   | Initial poll — copies 64-byte cfg prefix + 3 bools to state; reaches cancel_orders_on_start gate at 0xf7824 |
+|   1   | 0xf8314   | `panic_const_async_fn_resumed` (completion trap) |
+|   2   | 0xf8308   | `panic_const_async_fn_resumed_panic` (double-resume trap) |
+|   3   | 0xf797f   | Cancel-all-orders continuation (`TradingClient::cancel_all_open_orders` call site at 0xf798e) |
+|   4   | 0xf7744   | (first waker-slot, part of init cluster) |
+|   5   | 0xf77ad   | (init cluster)                          |
+|   6   | 0xf773f   | (init cluster)                          |
+|   7   | 0xf7722   | (init cluster)                          |
+|   8   | 0xf772c   | (init cluster)                          |
+|   9   | 0xf7749   | (init cluster)                          |
+|  10   | 0xf771d   | (init cluster)                          |
+|  11   | 0xf7727   | (init cluster)                          |
+|  12   | 0xf77b2   | (init cluster)                          |
+|  13   | 0xf774a   | (init cluster)                          |
+|  14   | 0xf839a   | (epilogue cluster)                      |
+|  15   | 0xf8389   | (epilogue cluster)                      |
+|  16   | 0xf7e92   | websocket-read resume A                 |
+|  17   | 0xf7efd   | websocket-read resume B                 |
+|  18   | 0xf7f1e   | message-dispatch continuation           |
+|  19   | 0xf83ca   | (end-of-market path)                    |
+|  20   | 0xf83a8   | (end-of-market path)                    |
+|  21   | 0xf8235   | place_batch_buy_orders resume           |
+|  22   | 0xf823a   | place_batch_buy_orders resume (B)       |
+|  23   | 0xf7e9f   | message loop top                        |
+|  24   | 0xf83a5   | (teardown)                              |
+|  25   | 0xf8383   | (teardown)                              |
+|  26   | 0xf8217   | (teardown)                              |
+|  27   | 0xf821c   | (teardown)                              |
+
+States 1 and 2 are panic trampolines (completion traps) — standard
+Rust async codegen. States 4..13 cluster tightly in 0xf771d..0xf77b2
+suggesting they're the per-byte continuations for a small static
+future (probably the setup of the market-subscription message) that
+gets sliced into 10 micro-states by the LTO. The substantive logic
+lives in states 0, 3, 16–18, 21–23.
+
+Notably the state table has NO branch that reads the cfg bool fields
+directly — dry_run, enable_gamble etc. are already mirrored into
+dedicated state-struct bytes (+0x718, +0x719, +0x71a) during state
+0, and all subsequent states only read the mirrors. This means a
+single edit at the state-0 mirror-store can neutralise e.g.
+cancel_orders_on_start without touching the jumptable.
