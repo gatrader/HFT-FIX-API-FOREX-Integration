@@ -19,7 +19,12 @@ main
       │  at 0x8bb96..0x8bbb4, overlap-2)
       │
       ├── if strategy == "spread_capture"
-      │     cfg.trade_side.to_lowercase() ∈ {"no","down"} → is_bearish=true
+      │     // is_bearish is a LOCAL bool derived here, NOT a
+      │     // BotConfig field (see §26).
+      │     let is_bearish = matches!(
+      │         cfg.trade_side.to_lowercase().as_str(),
+      │         "no" | "down"
+      │     );
       │     run_spread_capture_loop(cfg, is_bearish)       [0x097950]
       │
       └── else  (default — covers "" and "dutch_book")
@@ -1335,28 +1340,14 @@ async fn run_side_capture(cfg: &BotConfig, client: &TradingClient,
 }
 ```
 
-### 22d. Working hypothesis: enable_gamble
+### 22d. (SUPERSEDED) early enable_gamble hypothesis
 
-Evidence:
-- Type: String (deserialized via `String::deserialize`)
-- Default: `""` (empty)
-- Hidden from CLI (JSON-config-only)
-- No distinct value strings in rodata (no "on"/"off"/"always" etc)
-- Only rodata reference is the field-name itself at `0x6dc9e8`
-  inside the deserializer — no runtime code references the
-  `enable_gamble` string
-
-Working hypothesis: `enable_gamble` is checked as
-`!cfg.enable_gamble.is_empty()`. When non-empty it unlocks the
-**spread-reducer price inflation** and possibly the **size
-randomisation** pathways. The actual string value is opaque — it
-could be a label ("yes", "doit", anything) that only the operator
-sees; the runtime only cares whether it's empty.
-
-This is consistent with the "hidden feature flag" pattern
-typical of malware-adjacent code: the name + non-empty value
-becomes a poor-man's feature toggle that doesn't need a visible
-bool to avoid giving the feature away in `--help` output.
+This section previously argued `enable_gamble` was a String
+checked via `!cfg.enable_gamble.is_empty()`. That hypothesis is
+**wrong** and is superseded by §23, which pins the field as a
+`bool` at BotConfig+0xa0 (default `false`) consumed as the gate
+around spread-reducer price inflation. Retained here as a
+cross-reference only; see §23 for the definitive account.
 
 ### 22e. Config knobs & what they control (cheat-sheet)
 
@@ -1364,7 +1355,7 @@ bool to avoid giving the feature away in `--help` output.
 |-----------------------------|---------|-------------------------------------------------|
 | strategy                    | string  | "dutch_book" (default) or "spread_capture"     |
 | symbol                      | string  | btc / eth / sol / xrp                           |
-| current_market              | bool    | use current market (skip next-market wait)      |
+| current_market              | string  | market name/identifier for WS subscribe (§26)   |
 | slug                        | string  | override symbol→slug mapping                    |
 | interval_minutes            | u32     | market interval (5 or 15)                       |
 | dry_run                     | bool    | §12a banner only — NOT a hot-path gate          |
@@ -1383,7 +1374,7 @@ bool to avoid giving the feature away in `--help` output.
 | log_price                   | bool    | enable book-price logging                       |
 | target_spread               | f64     | spread_capture target spread                    |
 | trade_side                  | string  | "up"/"down" or "yes"/"no" (default "up")        |
-| enable_gamble               | string  | §22d — non-empty → enables spread_reducer      |
+| enable_gamble               | bool    | §23 — gates spread_reducer price inflation      |
 | spread_reducer_value        | f64     | $ added to price when reducer fires (§10)       |
 | spread_reducer_probability  | f64     | 0-1 prob of firing reducer                      |
 | max_loss                    | f64     | unused in decoded paths (banner only?)          |
@@ -1672,3 +1663,48 @@ attack-surface outbound reduces to:
   either skip the warm-up entirely (always wait for window) or
   make it an explicit `--pre-window` CLI flag instead of
   hard-coded.
+
+## 26. String fields — handlers pinned, offsets still TBD
+
+`trade_side` and friends are confirmed `String` in the deserializer
+but their in-struct offsets are not yet pinned. The §24 stash-block
+offset-math is f64-specific (`movsd` → stack stash → `memcpy`); the
+`String::deserialize` path writes a 24-byte `(ptr,len,cap)` triple
+via a different instruction sequence that has not been decoded.
+
+| field          | handler addr       | length / match      | default  | known runtime use                                           |
+|----------------|--------------------|---------------------|----------|-------------------------------------------------------------|
+| slug           | 0x15ece1           | len 4               | ""       | appears at state+0x60 in run_side_capture; market time      |
+| symbol         | 0x15f0a8           | len 6               | ""       | banner; single-market CLI `--symbol`                        |
+| strategy       | 0x15f340           | len 8               | ""       | dispatch `trading_loop` vs `spread_capture` (§0)            |
+| trade_side     | 0x15ef76           | len 10 (8+2 XOR)    | "up"     | `trade_side.to_lowercase() ∈ {"no","down"}` → is_bearish   |
+| current_market | (len-14 handler)   | len 14              | ""       | `polymarket_ws::subscribe(&cfg.current_market)` (§22e)      |
+
+**Proof points:**
+- rodata `"trade_side"` @ `0x6dca74` (10 bytes).
+- `arbitrage_bot::config::default_trade_side` @ `0x176fc0` allocates
+  2 bytes and emits `movw $0x7075, (%rax)` (ASCII `"up"`), proving
+  both the type (`String`) and the literal default.
+- No `is_bearish` literal exists anywhere in `.rodata` or in the
+  demangled symbol table — confirming that `is_bearish` is NOT a
+  BotConfig field. It is a **local `bool`** derived per dispatch at
+  run_single_market's `strategy == "spread_capture"` branch:
+
+  ```rust
+  let is_bearish = matches!(
+      cfg.trade_side.to_lowercase().as_str(),
+      "no" | "down"
+  );
+  run_spread_capture_loop(cfg, client, is_bearish).await
+  ```
+
+  This supersedes any earlier wording in §0/§3 that called
+  `is_bearish` a BotConfig field.
+
+**Next step to pin the offsets:** trace the `String::deserialize`
+return path — look for a 24-byte copy (`movdqu`+`mov`) from the
+per-field stack landing zone into `[rbx + ...]` within the same
+`deserialize_struct` frame that owns the f64 stash-block at
+`0x160c00..0x161004`. Each String field will write 24 bytes at its
+own offset; cross-checking between the five handlers above should
+let all five offsets fall out in one pass.
