@@ -683,6 +683,93 @@ This is the only pre-trade size cap besides the per-batch
   generator (`run_user_ws_monitor` state machine at 0xb5f50 uses
   state byte at `self+0x660` with jumptable at 0x6cb5e8).
 
+## 11c. cancel_orders_on_start gate (run_trading_loop, 0x0f7824)
+
+Located inside
+`arbitrage_bot::websocket::market_ws::run_trading_loop::{closure}`
+(symbol `_ZN13arbitrage_bot9websocket9market_ws16run_trading_loop...4055`).
+
+State-struct booleans are loaded sequentially at 0x0f73fc..0x0f7437:
+
+```
+0f73fc: movzbl 0x718(%rbp),%eax       ; bool A → mirror at +0x71c
+0f7403: mov    %al,0x71c(%rbp)
+0f7428: movzbl 0x719(%rbp),%ebp       ; cancel_orders_on_start → %bpl
+0f742f: movzbl 0x71a(%r15),%eax       ; bool C → mirror at +0x71d
+0f7437: mov    %al,0x71d(%r15)
+```
+
+State-struct offsets in run_trading_loop:
+| offset | type    | role                                |
+|--------|---------|-------------------------------------|
+| 0x110  | ptr     | TradingClient (cancel-orders target) |
+| 0x718  | u8 bool | (one of dry_run / log_price / enable_gamble) |
+| 0x719  | u8 bool | **cancel_orders_on_start** (PINNED) |
+| 0x71a  | u8 bool | (one of dry_run / log_price / enable_gamble) |
+| 0x71b  | u8      | async dispatch state byte           |
+
+The actual gate is at 0x0f7824:
+
+```
+f7824: test  %bpl,%bpl
+f7827: je    0xf7b31                 ; if FALSE → "Skipping order cleanup"
+                                      ; (tracing meta @ 0x86a340, str @ 0x6db313)
+f782d..f793b: format & println "🧹 Cleaning up any previous open orders..."
+              (tracing meta indirectly via 0x86a360, str @ 0x6db352)
+f7966: mov   0x110(%rbp),%rax        ; load TradingClient ptr
+f796d: add   $0x10,%rax              ; +16 = inner client field
+f798e: call  0xfe670 <TradingClient::cancel_all_open_orders::{closure}>
+```
+
+Semantics:
+```rust
+if cancel_orders_on_start {
+    info!("🧹 Cleaning up any previous open orders...");
+    let n = trading_client.cancel_all_open_orders().await?;
+    info!("✅ Cancelled {} old orders", n);
+} else {
+    info!("⏭️  Skipping order cleanup (cancel_orders_on_start=false)");
+}
+```
+
+The `--no-cancel-orders-on-start` clap flag (string at 0x6dc890+ in
+`.rodata` arg-list blob) is the user-facing way to set this to
+false; useful for "multi-bot on same wallet" deployments per the
+help text.
+
+## 12a. dry_run banner mirror (CachedParkThread::block_on)
+
+The startup banner reads the dry_run flag from a state-struct
+mirror at +0x17c (different mirror than the run_trading_loop
+state). At 0x0109c25 (and again at 0x0019968f in another
+monomorphization):
+
+```
+109c25: movzbl 0x17c(%rbx),%eax        ; dry_run as bool→u64 (0 or 1)
+109c2c: test   %rax,%rax
+109c2f: lea    0x6cd278(%rip),%rcx     ; "LIVE" (4 chars)
+109c36: lea    0x6dbc9d(%rip),%rdx     ; "DRY RUN" (7 chars)
+109c3d: cmovne %rdx,%rcx               ; if dry_run, pick "DRY RUN"
+109c41: lea    0x4(%rax,%rax,2),%rax   ; len = 3*flag + 4
+                                        ;   flag=0 → 4  ("LIVE")
+                                        ;   flag=1 → 7  ("DRY RUN")
+```
+
+The mirror at +0x17c is also read in three later sites
+(0x3664bf, 0x36654d, 0x36674c, 0x3668c4) inside the
+reqwest connect path — but those are unrelated coincidental
+offsets on a different state struct (the banner-rbx and the
+reqwest-rbx point to different futures).
+
+The actual no-network gate (i.e. the place where the bot decides
+"don't submit this order to Polymarket") lives inside
+`TradingClient::place_single_order` (0x0e1a10) and/or
+`place_batch_buy_orders` (0x0c5390). The dry-run side path emits
+log messages "Fallback timer (s) expired, simulating BUY fill"
+(rodata 0x6d9ebd) suffixed with " DRY" (rodata 0x6d9e9f) — it
+short-circuits the order-place call and starts a fallback timer
+that synthesises a fill event after a fixed delay. Pin TBD.
+
 ## 13. Summary: "bypass dangerous parts" checklist
 
 For the clone:
