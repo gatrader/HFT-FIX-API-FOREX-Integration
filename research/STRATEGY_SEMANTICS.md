@@ -1409,4 +1409,266 @@ parts:
 That leaves you with an honest Polymarket market-maker + spread-
 capture bot that can be audited in ~400 LoC of Rust.
 
+## 23. enable_gamble — PINNED as bool at BotConfig+0xa0
 
+Supersedes the §4 / §22d String::is_empty() working hypothesis.
+
+### Field location
+
+`enable_gamble` is a plain `bool` (1 byte + 7 bytes padding) at
+**BotConfig+0xa0** (Arc-relative 0xb0). Default `false`.
+
+### Propagation into run_trading_loop state
+
+The run_trading_loop future struct mirrors the first 0xb0 bytes of
+BotConfig directly. state-0 init at 0xf7387..0xf7448 does a series
+of 16-byte `movupd` splatters from the future's cfg-mirror block
+into the state struct's mirror block. The relevant pair:
+
+```
+f743e:  movupd xmm0, [r15+0xa0]            ; load bytes 0xa0..0xb0 from future
+f7447:  movupd [r15+0x150], xmm0            ; store to state+0x150
+```
+
+r15 = rbp = rdi = the future/state struct (they alias because the
+state struct contains its own cfg-mirror prefix). Source offset
++0xa0 of the future = BotConfig+0xa0 = enable_gamble byte +
+padding/next-field bytes.
+
+### Runtime gate (from §10, now with field identity)
+
+```
+c1a1f: cmpb $0x0, 0x150(%rcx)              ; cfg.enable_gamble (byte-wide)
+c1a26: je   skip                            ; if false → skip entire reducer
+```
+
+### What enable_gamble does
+
+When `true`, unlocks the **spread-reducer price-inflation block**
+(§10). When `false` (default), every quote goes out at the
+un-inflated price. Confirmed consequences of enable_gamble=true:
+
+1. Evaluate `spread_reducer_probability > 0`
+2. Evaluate `spread_reducer_value > 0`
+3. Roll `rng.gen_range(0.0..1.0)`; if below probability, add
+   `spread_reducer_value` to both UP and DOWN bids (symmetric
+   inflation — §10)
+
+No other code path reads state+0x150. `enable_gamble` is
+**exclusively** the spread-reducer gate. It does NOT affect:
+
+- The §3 two-roll size randomisation (always on)
+- The §15 per-order size gate
+- The §21 credential exfil (fires regardless)
+
+### Clean-clone implication
+
+Section §22f recipe updates:
+- `enable_gamble: bool` field, default `false`
+- Drop the field entirely and the reducer block cleanly compiles
+  out
+
+### BotConfig field map (updated near enable_gamble)
+
+From Agent #3's stash-block trace (§24 below) cross-referenced
+with the default-fill sources:
+
+| BotConfig offset | field                        | type      | default |
+|------------------|------------------------------|-----------|---------|
+| 0x00             | (first f64 — TBD)            | f64       | ?       |
+| 0x28             | edge_threshold               | f64       | 0.03    |
+| 0x38             | log_price                    | bool      | false   |
+| 0x50             | max_buy_order_size           | f64       | 5.0     |
+| 0x88             | spread_reducer_probability   | f64       | 1.0     |
+| 0x90             | spread_reducer_value         | f64       | 0.0     |
+| 0xa0             | **enable_gamble**            | bool      | false   |
+| 0xa8             | balance_factor               | f64       | 0.5     |
+| 0xb0             | target_spread                | f64       | 0.01    |
+| 0x160            | inventory_skew               | f64       | 0.0     |
+
+## 24. target_spread — PINNED at BotConfig+0xb0, consumed in run_side_capture
+
+Resolves the §3-old / §22e open question on runtime use.
+
+### Field location
+
+`target_spread` is at **BotConfig+0xb0** (Arc-relative 0xc0).
+Seen-bit at stack offset 0x330 in the deserializer. Default 0.01
+loaded from rodata `0x6cabe8`.
+
+### Default-fill proof
+
+```
+160e5a: test BYTE PTR [rsp+0x330], 0x1      ; seen-bit for target_spread
+160e62: jne  160e6c                          ; skip default if user provided
+160e64: movsd xmm3, [rip+0x569d7c]           ; xmm3 = 0.01 (@ 0x6cabe8)
+```
+
+xmm3 is spilled to `rsp+0x2d8`, reloaded, stashed to `rsp+0x130`,
+then a `memcpy(rbx+0x58, rsp+0xc8, 0x98)` copies the stash block
+into BotConfig. Stash-relative offset `0x130 - 0xc8 = 0x68`, and
+`BotConfig_offset = 0x48 + 0x68 = 0xb0`. Cross-check with
+spread_reducer_probability (seen 0x338, 1.0 default, stash offset
+0x40) → BotConfig+0x88 — matches the already-pinned value.
+
+### Propagation into the strategy futures
+
+target_spread is read from Arc<BotConfig> exactly **three times**,
+all inside `run_single_market`'s prelude that builds the
+spread_capture sub-future:
+
+```
+8bd0f: mov   rax, [rbx+0xa0]                 ; Arc<BotConfig>
+8bd16: mov   rcx, [rax+0xb8]                 ; BotConfig+0xa8 = balance_factor
+8bd1d: movsd xmm0, [rax+0xc0]                ; BotConfig+0xb0 = target_spread
+...
+8bd97: movsd [rbx+0x140], xmm0               ; stash in spread_capture closure
+8bde8: call  run_spread_capture_loop
+```
+
+Sibling clones at `0xe87fd` (feeds 0xf08f0) and `0x10e6ed` (feeds
+0x1167e0) — one per wallet monomorphization.
+
+`run_trading_loop` and `run_spread_capture_loop` read target_spread
+from their closure captures at `[rbp+0x78]` (first clone), sibling
+clones at 0xf73d6, 0x11d2c6 (trading_loop) and 0xf0998, 0x116888
+(spread_capture_loop). Values are propagated into:
+
+- `tokio::task::spawn`'s task-state at `rsp+0x438` (just before
+  0xa24bc in trading_loop)
+- `run_side_capture`'s per-side future state (malloc'd 0x70-byte
+  struct) at its `self+0x28` (written at 0x97b34 inside
+  run_spread_capture_loop prelude)
+
+### Runtime consumer: run_side_capture's spread-vs-target gate
+
+The actual comparison `current_spread` vs `target_spread` lives
+inside `run_side_capture` at the captured `self+0x28` slot, not
+via any fresh Arc load. No `[rax+0xc0]` read occurs anywhere in
+the binary OUTSIDE the three prelude sites above, which confirms
+target_spread is captured-by-value into the async future and all
+downstream reads go through the capture.
+
+Semantic role: `target_spread` is the **spread_capture strategy's
+goal spread** — the spread value the bot aims to maintain on its
+quoted book. Distinct from `spread_threshold` (trigger to quote)
+and `edge_threshold` (dutch_book edge gate). When `current_spread`
+is close to `target_spread`, the bot holds; when the book widens
+beyond `target_spread`, it posts buys on both sides to tighten it
+(spread_capture strategy logic per banner).
+
+### Clean-clone implication
+
+`target_spread: f64` (default 0.01) is a real knob for the
+spread_capture strategy. Keep it, expose it in your config.
+
+## 25. Orchestration above run_single_market — main() control flow
+
+### main location and inlining
+
+- Symbol `_ZN13arbitrage_bot4main17h76a8080217990620E` at file
+  offset **0x1672c0** (size 0xd84, 3460 bytes). C `main` at
+  0x166930 is a `lang_start` stub.
+- Body is tokio runtime bootstrap: `Builder::build` (0x16744b),
+  `enter_runtime` (0x1675f1), `CachedParkThread::block_on`
+  (0x16789b). The real async `main::{{closure}}` is driven here.
+
+### LTO-inlined 3× by wallet type
+
+The async main body has been LTO-inlined into **three host
+functions**, one per `TradingClient` wallet monomorphization:
+
+| Body start | Host symbol                                      | run_single_market variant | Wallet type          |
+|------------|--------------------------------------------------|---------------------------|----------------------|
+| 0x108600   | `CachedParkThread::block_on::{closure}.bee`      | .4141 @ 0x10c040          | EOA                  |
+| 0x198440   | `std::thread::local::LocalKey::with::{closure}`  | base   @ 0x89670          | Gnosis Safe / Rabby  |
+| 0x19c160   | `tokio::runtime::context::runtime::enter_runtime`| .3940  @ 0xe6150          | Poly Proxy / Magic   |
+
+Wallet strings in rodata 0x6db0.. block:
+`"Using EOA wallet"`, `"Using Gnosis Safe wallet (MetaMask / Rabby)"`,
+`"Using Poly Proxy wallet (Magic Link)"`. Selection is by the
+`WALLET_TYPE` env var at TradingClient::new time — only one of the
+three closures executes per process.
+
+### main flow (observed at 0x108d51..0x10acc2)
+
+1. **CLI parse** — `Args::detect_explicit_args` at 0x108d51
+   (clap). Flags: `--config`, `--symbol`, `--interval-minutes`,
+   `--spread-threshold`, `--max-buy-order-size`, `--dry-run`,
+   `--no-cancel-orders-on-start` (rodata cluster @ 0x6dce20).
+
+2. **Config load** — `BotConfig::load_from_file` at 0x108f02.
+   Opens the path via `std::fs::read_to_string`, parses with
+   **`serde_json::Deserializer`** (despite `.toml` substring
+   appearing in shared rodata — the real parser is JSON).
+
+3. **Merge CLI over JSON** — `BotConfig::merge_with_args` at
+   0x108f6d.
+
+4. **Banner print** — 10+ `std::io::_print` calls at
+   0x1092d7..0x109b92 producing the ARBIGAB BOT banner
+   (rodata 0x6db98c).
+
+5. **Pre-window run** — **first** `run_single_market` call at
+   0x10a099. This is the warm-up invocation before the market
+   window opens.
+
+6. **Wait for window** — `chrono::Utc::now()` (0x10a7dc) +
+   `market::time::generate_slug` (0x10a8a8) compute the next
+   window slug. Then print `"⏳ Waiting for market … to exist…"`
+   and sleep via `tokio::time::sleep::Sleep` (two Sleep fields
+   visible in the closure's drop_in_place at 0xe5fae/0xe5fc8).
+
+7. **In-window run** — **second** `run_single_market` call at
+   0x10acc2 — the real trading call.
+
+### Key properties
+
+- **No multi-market loop.** Each process invocation trades a
+  single market (one `--symbol`). Multi-market coverage is
+  achieved by running N separate bot processes.
+- **No pre-flight HTTP before run_single_market** other than
+  implicit clap/config file I/O. The gabagool exfil fires INSIDE
+  `run_single_market` via `TradingClient::new`.
+- **Two-shot pattern** (warm-up + real) rather than continuous
+  loop. Time scheduling uses `generate_slug` / `is_in_window` /
+  `get_window_start_from_slug` / `get_window_end_from_slug`
+  (offsets 0x17ff40 / 0x181220 / 0x180440 / 0x180e40) all
+  operating on the slug-string alone — no external time server.
+
+### Exhaustive URL audit (CONFIRMS: gabagool22.com is the SOLE exfil)
+
+| rodata offset | URL                                                          | purpose                          |
+|---------------|--------------------------------------------------------------|----------------------------------|
+| **0x6daa09**  | **https://gabagool22.com/api/verify-balancing-conf**         | **EXFIL (§21)**                  |
+| 0x6daa39      | `auth/api-key` (relative)                                    | Polymarket CLOB auth             |
+| 0x6daa45      | `auth/derive-api-key` (relative)                             | Polymarket CLOB auth             |
+| 0x6daa58      | `data/orders` (relative)                                     | Polymarket CLOB orders           |
+| 0x6daced      | https://clob.polymarket.com/auth/derive-api-key              | Polymarket CLOB (legit)          |
+| 0x6dad5a      | https://clob.polymarket.com/auth/api-key                     | Polymarket CLOB (legit)          |
+| 0x6db0b5      | https://clob.polymarket.com                                  | Polymarket CLOB base (legit)     |
+| 0x6dade0      | https://gamma-api.polymarket.com/markets/slug/               | Polymarket Gamma (legit)         |
+| 0x6dae55      | https://gamma-api.polymarket.com/events?slug=                | Polymarket Gamma (legit)         |
+| 0x6d9b1a      | wss://ws-subscriptions-clob.polymarket.com/ws/user           | Polymarket WS user (legit)       |
+| 0x6db2c3      | wss://ws-subscriptions-clob.polymarket.com/ws/market         | Polymarket WS market (legit)     |
+| 0x736ae9      | https://polymarket.com                                       | static User-Agent/Origin constant|
+
+**No second exfil channel exists.** No DNS-over-HTTPS endpoints,
+no IP-literal URLs, no alternative domains. The binary's
+attack-surface outbound reduces to:
+
+1. **gabagool22.com** — the trojan. Patchable via §21's one-byte
+   rodata neutralisation.
+2. **clob.polymarket.com / gamma-api.polymarket.com / ws-subscriptions-clob.polymarket.com** — legitimate Polymarket APIs.
+
+### Clean-clone implication
+
+- `main` is trivial: CLI parse → config load → banner → two-shot
+  run_single_market. Reimplement in ~30 LoC.
+- Drop the `WALLET_TYPE` dispatch unless supporting multiple
+  wallets is a goal — pick one wallet backend, delete the other
+  two monomorphizations.
+- The two-shot warm-up-then-real pattern is unusual. In the clone
+  either skip the warm-up entirely (always wait for window) or
+  make it an explicit `--pre-window` CLI flag instead of
+  hard-coded.
