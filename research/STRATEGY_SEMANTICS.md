@@ -862,3 +862,159 @@ dedicated state-struct bytes (+0x718, +0x719, +0x71a) during state
 0, and all subsequent states only read the mirrors. This means a
 single edit at the state-0 mirror-store can neutralise e.g.
 cancel_orders_on_start without touching the jumptable.
+
+## 15. place_single_order — SIZE-GATED simulation (state 0, 0xe1a48)
+
+`place_single_order` is the leaf submit-one-order future called from
+both `run_side_capture` (state 8 at 0xde73a) and the trading-loop
+batch path. Its state-0 entry contains the **real** dry-run gate of
+the bot — and it is **not** keyed on the `dry_run` config bool, but
+on the **per-order requested size** vs. the constant 5.0 (the same
+constant that doubles as the `max_buy_order_size` clap default at
+0x6caba0).
+
+State-0 disassembly (annotated):
+
+```
+e1a48: mov   WORD PTR [rbx+0x81], 0x0           ; clear state-flag word
+e1a81: movsd xmm0, QWORD PTR [rip+0x5e9117]     ; xmm0 = 5.0  (@ 0x6caba0)
+e1a89: ucomisd xmm0, QWORD PTR [rbx+0x48]       ; cmp 5.0  vs  state+0x48 (order_size)
+e1a8e: jbe   e1c13                              ; if 5.0 <= order_size → REAL path
+
+;--- fall through here when order_size < 5.0  : SIMULATION path ---
+e1a94: lea   r12, [rsp+0xc0]
+e1a9f: call  now_str                            ; chrono::Local::now to ISO-8601
+e1aa4..e1b3f: build format_args!("[{ts}] [SIM] would post order size={size} <5.0", ...)
+e1bc7: call  std::io::_print                    ; stdout — NO http call!
+e1bcc..e1bf8: drop format strings, free buffers
+e1bfe: dec   r15                                ; refcount decrement on captures
+e1c01: mov   rbp, r15
+e1c04: jmp   e28a6                              ; return Poll::Ready(Ok(())) — no post_orders
+```
+
+Real-order continuation at `0xe1c13`:
+
+```
+e1c1a: lea   rdi, [rip+0x5eb6c3]                ; "SELL" @ 0x6cd2e4
+e1c23: cmovne rdi, rsi                          ; if cl != 0 use "BUY"
+e1c27: lea   rsi, [rbx+0x58]                    ; outcome string slot
+e1c33: mov   esi, 0x4 ; sub  rsi, rcx           ; len = 4 - cl  (SELL=4, BUY=3)
+e1c43..e24a7: order body construction
+              (price, size, signature payload, timestamp)
+e1c47: mov   rdi, [rbx+0x40]                    ; trading_client
+e1c4f: lea   rsi, [rbx+0x58]                    ; outcome
+e1c54: mov   rdx, [rbx+0x60]                    ; price (f64)
+e1c5c: movsd xmm0, [rbx+0x48]                   ; size (f64)
+e1c64: movsd xmm1, [rbx+0x50]                   ; price (f64)
+e1c6a: movzbl ecx, [rbx+0x68]                   ; side byte
+e1c6e: ...
+e24ac: call  TradingClient::post_orders         ; → 0xd0ef0
+```
+
+### Why this matters for the bypass plan
+
+1. **Dry-run is not a config knob in the hot path.** Even with
+   `dry_run=true` in BotConfig, every code path that has been
+   decoded (state-0 mirror at +0x71a, banner print at §12a) only
+   *reads* the mirror; the actual no-op decision in the order
+   submitter is the size-vs-5.0 gate.
+2. **Cloning the bot for paper-trading is one byte.** Patch
+   `0xe1a8e` from `jbe` (0x76) to `jmp` (0xeb), keep the next byte
+   (the rel8 displacement to 0xe1c13 = +0x83 — too far for jmp
+   short, so use `0x0F 0x86` near-jbe → `0xE9 + rel32` near-jmp).
+   Concretely: replace the 6-byte `0F 86 7F 01 00 00` (jbe near
+   +0x17f) with `E9 80 01 00 00 90` (jmp near +0x180; pad nop) —
+   verifies size is fully *ignored* and the SIM branch is dead.
+   Inverse patch (`jbe`→`jb` flip) **disables** the live trading
+   path entirely: every order becomes a stdout print.
+3. The size-gate is per-call, not per-loop, so there is **no race**
+   between the gate and the size randomisation in §3 — the
+   randomised actual size from `gen_range(0,1) * target` lands in
+   `state+0x48` *before* state-0 begins.
+
+## 16. post_orders is unconditional (no internal dry_run check)
+
+`TradingClient::post_orders` lives at `0xd0ef0` (size 0x6046 bytes).
+Its state-0 entry shows no comparison against any bool, no
+inspection of `[client+offset]` for a dry_run mirror, and no
+fall-through to a print/log path. The first ~0x140 bytes are
+straight `reqwest::Client::request` setup:
+
+```
+d0ef0: push  ... ; sub rsp, 0xc78
+d0f0c: movzbl eax, BYTE PTR [rsi+0x148]         ; resume-state byte
+d0f13: lea   rcx, [rip+0x5fa91a]                ; jumptable @ 0x6cb834
+d0f1a: movslq rax, DWORD PTR [rcx+rax*4]
+d0f1e: add   rax, rcx
+d0f21: jmp   rax
+d0f28: ; state 0 entry ----------------------------------------
+d1014: mov   rsi, [r14+0x128]                   ; client.http_client
+       ; (no test/cmp on any flag here)
+d1033: call  reqwest::Client::request           ; build POST request
+       ;       + URL = format!("{}/orders", base_url)
+       ;         (URL fmt @ 0x866df0, suffix "orders" @ 0x6d8ce4)
+```
+
+The implication: **if execution reaches `post_orders`, an HTTPS
+POST goes out**. There is no second safety net inside the order
+submitter. Any kill-switch must be implemented at one of:
+
+- §15 above (`place_single_order` size gate at `0xe1a8e`)
+- the call-site itself (`0xe24ac` in `place_single_order` → patch
+  to `nop` 5 bytes + skip)
+- `run_side_capture` state 8 at `0xde754` (skip the inner
+  `place_single_order` call entirely)
+
+## 17. cfg pointer identity in run_side_capture (Arc<BotConfig>)
+
+The conflict noted earlier — deserializer says `BotConfig+0x10` is
+`strategy.len()` (u64) but runtime code at `0xda047` does
+`movsd  xmm0, QWORD PTR [rcx+0x10]` (treating it as f64) — resolves
+to: **the pointer at `state+0x60` is `Arc<BotConfig>`, not
+`&BotConfig`**. Rust's `Arc<T>` prepends a 16-byte `ArcInner`
+header (strong:usize, weak:usize) before the `T`, so:
+
+```
+arc_ptr            → strong count (u64)
+arc_ptr + 0x08     → weak   count (u64)
+arc_ptr + 0x10     → BotConfig start  (this is what runtime code dereferences)
+arc_ptr + 0x10+0x10= BotConfig+0x10   = strategy.len()   (deserializer view)
+```
+
+So `[cfg+0x10]` at runtime = `BotConfig+0x00` = the **first f64
+field** of BotConfig (almost certainly `target_spread` based on
+the Section-1 default-fill table — the 0x328 stack slot maps to
+the lowest cfg offset).
+
+This Arc-header offset of 0x10 is consistent with every other
+runtime cfg-read in the side-capture loop:
+- `0xda047`  : `movsd xmm0, [rcx+0x10]`  → BotConfig+0x00 (f64)
+- `0xda053`  : `movsd xmm1, [rcx+0x18]`  → BotConfig+0x08 (f64)
+- `0xde6fd`  : `movsd xmm2, [rcx+0x18]`  → same
+- `0xdabff`  : compares `[rcx+0x60]` against 5.0 → BotConfig+0x50
+
+i.e. the 0xdabff branch (originally suspected as the dry-run gate)
+reads `BotConfig+0x50`, NOT `+0x60`. With the Arc offset, this is
+consistent with `max_buy_order_size` being at BotConfig+0x50 (size
+gate against the same 5.0 default const). The 0xdabff branch is
+therefore an **upper-bound clamp** on a *target* size before it
+becomes the per-order randomised size — distinct from the
+post-randomisation per-order gate in §15.
+
+## 18. Combined kill-switch / paper-trading patch set (verified)
+
+Single-byte and short patches sufficient to convert the bot into
+a fully-passive observer (writes nothing to Polymarket):
+
+| addr     | original    | patched     | effect                         |
+|----------|-------------|-------------|--------------------------------|
+| 0xe1a8e  | 0F 86 ...   | 0F 87 ...   | flip `jbe`→`ja`: every order → SIM print |
+| 0xe24ac  | E8 .. .. .. .. | 90 90 90 90 90 | nop the post_orders call (defense in depth) |
+| 0xf798e  | E8 .. .. .. .. | 90 90 90 90 90 | nop cancel_all_open_orders (preserves any pre-existing book) |
+
+To run in **mirror mode** (post real orders, but also tee them to
+stdout/file), revert the first patch and instead hook a
+`println!` between `0xe24a7` (last arg setup) and `0xe24ac` (the
+call). 16 bytes free at `0xe28b0..0xe28c0` if the simulation
+print code is dead-stripped.
+
