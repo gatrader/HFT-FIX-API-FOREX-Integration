@@ -263,15 +263,262 @@ Core arbitrage/market-making logic to KEEP:
 | 0x6cb324  | jumptable: run_trading_loop state dispatch (28-ish)   |
 | 0x6cc9b4  | jumptable: BotConfig deserializer field-length switch |
 
-## 9. Open items (not blocking the rewrite)
+## 9. Complete BotConfig field roster (from deserialize_struct length jumptable)
 
-- Pin which struct offsets each inferred default field lives at,
-  so the bool-flag tracing for `enable_gamble` and `current_market`
-  can be finished deterministically.
-- Decode individual run_trading_loop state handlers (28 async
-  states). Most are "await future"; the interesting arithmetic
-  states are a small subset. Not needed to replicate the strategy
-  — we already have the sizing/reducer math.
-- Confirm `current_market` semantics. Its default (0 → false) and
-  the `trade_side` down/up overlap suggest it flips the
-  spread_capture side-assignment.
+The length-dispatch jumptable at `.rodata:0x6cc9b4` covers field-name
+lengths 4..26. Each entry is a signed 32-bit offset from 0x6cc9b4.
+Entries pointing to 0x15f520 mean "unknown field" (error). Decoded:
+
+| name length | handler addr | fields at this length                                                            |
+|-------------|--------------|----------------------------------------------------------------------------------|
+| 4           | 0x15ece1     | `slug`                                                                           |
+| 6           | 0x15f0a8     | `symbol`                                                                         |
+| 7           | 0x15ef0c     | `dry_run`                                                                        |
+| 8           | 0x15f340     | `strategy`, `cooldown`  *(two-way `bcmp` split)*                                 |
+| 9           | 0x15f3bc     | `log_price`, `min_price`, `max_price`  *(XOR-pair cascade at 0x15f3c0..0x15f418)*|
+| 10          | 0x15ef76     | `order_size`, `trade_side`                                                       |
+| 13          | 0x15f119     | `enable_gamble`, `target_spread`                                                 |
+| 14          | 0x15f1bc     | `trade_cooldown`, `balance_factor`, `current_market`, `edge_threshold`, `inventory_skew` |
+| 16          | 0x15f4e5     | `interval_minutes`, `spread_threshold`                                           |
+| 17          | 0x15f466     | `max_position_size`                                                              |
+| 18          | 0x15edc0     | `stop_before_end_ms`, `max_buy_order_size`                                       |
+| 19          | 0x15f00d     | `refresh_interval_ms`                                                            |
+| 20          | 0x15ee90     | `spread_reducer_value`                                                           |
+| 22          | 0x15ed45     | `cancel_orders_on_start`                                                         |
+| 26          | 0x15f2c4     | `spread_reducer_probability`                                                     |
+
+Lengths 5, 11, 12, 15, 21, 23-25 are unhandled (the CLI-only flags
+`no_log_price` (12) and `no_cancel_orders_on_start` (25) are merged
+into the JSON struct elsewhere).
+
+**Total: 22 serde-recognised JSON fields in `BotConfig`.** The
+deserializer's seen-bit stack offsets (from the `cmpq $0, N(%rsp)`
+before each field-handler body) give a reproducible ordering:
+
+| field                            | seen-bit stack offset | handler entry |
+|----------------------------------|-----------------------|---------------|
+| `spread_reducer_probability`     | 0x218                 | 0x15f2c4      |
+| `strategy`                       | 0x348                 | 0x15f340      |
+| `log_price`                      | 0x338                 | 0x15f419      |
+| `max_position_size`              | 0x1e0                 | 0x15f466      |
+| `cancel_orders_on_start`         | 0x1e8 (byte flag)     | 0x15ed45      |
+| `dry_run`                        | 0x1a0 (byte flag)     | 0x15ef0c      |
+| `spread_reducer_value`           | 0x1f0                 | 0x15ee90      |
+| `max_buy_order_size` / `stop_before_end_ms` | 0x1f0 / 0x360 | 0x15edc0  |
+| `edge_threshold` (§1 flag 0x358) | 0x358                 | 0x15f1bc      |
+| `refresh_interval_ms`            | 0x1f8                 | 0x15f00d      |
+| `interval_minutes` / `spread_threshold` | 0x208          | 0x15f4e5      |
+| `trade_cooldown`                 | 0x48                  | 0x15f1bc      |
+| `balance_factor`                 | 0x328                 | 0x15f1bc      |
+| `target_spread`                  | 0x330                 | 0x15f119      |
+| `slug`                           | 0x360                 | 0x15ece1      |
+
+Fields sharing a handler use a secondary XOR-pair or `bcmp` dispatch
+inside the handler (e.g. `strategy` vs `cooldown` at len 8 uses a
+single 8-byte movabs compare `"strategy"` == `0x7967657461727473`, then
+falls through to `bcmp` for `cooldown`).
+
+## 10. Spread-reducer price-inflation (verified)
+
+The spread-reducer mechanism is implemented inside
+`run_trading_loop` (inlined into the tokio poll state machine at
+0x089000..0x0c3000). The exact inflation path at 0x0c1a1f..0x0c1aa7:
+
+```
+c1a1f: cmpb $0x0, 0x150(%rcx)      ; bool gate (spread_reducer enabled?)
+c1a26: je   skip                    ; byte is the per-batch enable
+c1a31: movsd 0x98(%rax), %xmm1      ; load spread_reducer_probability
+c1a3d: ucomisd %xmm0, %xmm1         ; xmm0 = 0.0
+c1a41: jbe  skip                    ; skip if probability <= 0
+c1a4c: movsd 0xa0(%rax), %xmm1      ; load spread_reducer_value
+c1a58: jbe  skip                    ; skip if value <= 0
+c1a5e: call thread_rng()
+c1a69: call gen_range(0.0 .. 1.0)   ; xmm0 = uniform sample
+c1a73: movsd 0x98(%rax), %xmm1      ; reload probability
+c1a7f: jbe  skip                    ; skip if probability <= sample
+c1a96: movupd (%r15), %xmm0         ; load (up_bid, down_bid) packed
+c1a9b: movsd  (%rbx), %xmm1         ; xmm1 = value
+c1a9f: unpcklpd %xmm1, %xmm1        ; broadcast to both lanes
+c1aa3: addpd  %xmm0, %xmm1          ; (up_bid+value, down_bid+value)
+c1aa7: movupd %xmm1, (%r15)         ; store both inflated bids
+```
+
+So the reducer:
+1. Requires a parent-struct enable byte at offset 0x150 (likely
+   `enable_gamble` propagated from config). If zero, no-op.
+2. Requires both `spread_reducer_probability > 0` **and**
+   `spread_reducer_value > 0`.
+3. Rolls uniform; triggers when `sample < probability`.
+4. Adds `spread_reducer_value` to **both** UP and DOWN bid prices
+   simultaneously (symmetric inflation — *not* just the side you're
+   buying).
+
+Adding to BOTH bids is the give-away: this is not "adjust my bid
+to close the spread", it's "inflate the book on both sides before
+quoting". It's a spoofing-adjacent tell.
+
+Confirmed field offsets (from a register holding the config
+pointer inside the state machine, rax-relative):
+
+| offset | field                         | type |
+|--------|-------------------------------|------|
+| 0x98   | `spread_reducer_probability`  | f64  |
+| 0xa0   | `spread_reducer_value`        | f64  |
+
+And a **separate** enable byte at 0x150 from the task's state
+pointer (rcx) — this is the `enable_gamble` kill-switch (§4). When
+false, the whole inflation block is short-circuited to `skip`.
+
+## 11. Extended rust pseudocode reconstruction
+
+Best-effort clean-room reconstruction combining all findings:
+
+```rust
+#[derive(Deserialize)]
+struct BotConfig {
+    // identity / market
+    symbol:                 String,
+    slug:                   Option<String>,
+    current_market:         String,
+    strategy:               String,                       // "" | "dutch_book" | "spread_capture"
+    trade_side:             String,  // "up" | "down"    (default = "up")
+    interval_minutes:       u32,     // default 15
+    min_price:              f64,     // default 0.0
+    max_price:              f64,     // default 1.0
+
+    // sizing
+    order_size:             f64,
+    max_buy_order_size:     f64,     // clap default 5.0
+    max_position_size:      f64,     // default 10.0  (§1 flag 0x1d8)
+    inventory_skew:         f64,     // directional multiplier for ±delta
+
+    // edge / spread gates
+    edge_threshold:         f64,     // default 0.03
+    spread_threshold:       f64,     // default 50.0  (cents? — printed as $)
+    target_spread:          f64,     // default 0.01
+
+    // spread reducer (gambling/spoof layer)
+    spread_reducer_probability: f64, // default 1.0
+    spread_reducer_value:       f64, // default 0.0
+    enable_gamble:              bool, // master kill-switch
+
+    // pacing
+    trade_cooldown:         u64,     // ms, default 5000
+    refresh_interval_ms:    u64,     // ms, default 2000
+    stop_before_end_ms:     u64,     // ms, default 0
+    balance_factor:         f64,     // default 0.5 (printed label: disabled/gentle/moderated/aggressive)
+
+    // flags
+    dry_run:                bool,
+    log_price:              bool,
+    cancel_orders_on_start: bool,
+}
+
+// ───── Core trading loop (simplified) ─────
+
+async fn run_trading_loop(cfg: Arc<BotConfig>, state: Arc<RwLock<Position>>) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(cfg.refresh_interval_ms)).await;
+
+        // stop_before_end_ms gate
+        let window_remaining = market.window_end_ms() - now_ms();
+        if cfg.stop_before_end_ms > 0 && window_remaining < cfg.stop_before_end_ms {
+            info!("Only {}s until window end, stopping early (stop_before_end_ms={})",
+                  window_remaining / 1000, cfg.stop_before_end_ms);
+            break;
+        }
+
+        // fetch best bid/ask
+        let (ask, bid) = orderbook.best_prices();
+        let spread = ask - bid;
+        if spread < cfg.spread_threshold { continue; }
+
+        // position-limit gate
+        let pos = state.read().await.net_shares();
+        if pos.abs() >= cfg.max_position_size {
+            info!("At max position {}, waiting for SELL fill", pos);
+            continue;
+        }
+
+        // edge check
+        let edge = compute_edge(&cfg, ask, bid);
+        if edge < cfg.edge_threshold { continue; }
+
+        // dry_run short-circuit
+        if cfg.dry_run { continue; }
+
+        place_batch_buy_orders(&cfg, ask, bid, pos).await;
+
+        // cooldown
+        tokio::time::sleep(Duration::from_millis(cfg.trade_cooldown)).await;
+        info!("Cooldown elapsed, cancelling orders...");
+        cancel_open_orders().await;
+    }
+}
+
+fn place_batch_buy_orders(cfg: &BotConfig, ask: f64, bid: f64, pos: f64) {
+    let A = cfg.max_buy_order_size;
+    let delta = (ask - bid) * pos * cfg.inventory_skew * 0.5;
+
+    // Book-inflation layer (§5, §10) — spoofs a tighter spread
+    let (mut up_bid, mut down_bid) = (bid, bid);
+    if cfg.enable_gamble
+        && cfg.spread_reducer_probability > 0.0
+        && cfg.spread_reducer_value > 0.0
+        && rand::thread_rng().gen_range(0.0..1.0) < cfg.spread_reducer_probability
+    {
+        up_bid   += cfg.spread_reducer_value;
+        down_bid += cfg.spread_reducer_value;
+        info!("🎲 Spread reducer triggered! Prices inflated by ${} → UP bid ${up_bid}, DOWN bid ${down_bid}",
+              cfg.spread_reducer_value);
+    }
+
+    // Size-randomisation layer (§3) — uniform [0, target] on each side
+    let yes_target = (A + delta).clamp(0.0, 2.0 * A);
+    let no_target  = (A - delta).clamp(0.0, 2.0 * A);
+    let mut rng    = rand::thread_rng();
+    let yes_actual = (rng.gen_range(0.0..1.0) * yes_target).round() as u64;
+    let no_actual  = (rng.gen_range(0.0..1.0) * no_target ).round() as u64;
+
+    // intensity_label is banner-only — doesn't gate runtime behaviour
+    place_limit_buy("YES", up_bid,   yes_actual);
+    place_limit_buy("NO",  down_bid, no_actual);
+}
+```
+
+## 12. Open items (not blocking the rewrite)
+
+- Exact `inventory_skew` multiplier role — confirmed to be an f64
+  config field but its usage inside the batch sizing formula is
+  still inferred from surrounding arithmetic at 0x0c5498.
+- Struct offsets for `current_market` and `trade_side` — both are
+  Strings, likely in the first 0x70 bytes of BotConfig. The
+  banner printer at 0x109800 can pin them; the code is
+  monomorphized 3× at 0x109800/0x199600/0x19d380.
+- Full run_spread_capture_loop state decode (28 async states).
+  Most are trivial `.await` wrappers; the arithmetic states are
+  shared with run_trading_loop via the same
+  `place_batch_buy_orders` helper.
+- Websocket message → state transitions inside the tokio
+  generator (`run_user_ws_monitor` state machine at 0xb5f50 uses
+  state byte at `self+0x660` with jumptable at 0x6cb5e8).
+
+## 13. Summary: "bypass dangerous parts" checklist
+
+For the clone:
+
+1. **Delete the `enable_gamble` branch entirely** — hard-code
+   `false`. That removes §10's inflation block cleanly.
+2. **Replace the two `gen_range * target` rolls** in
+   `place_batch_buy_orders` with straight `target.round() as u64`.
+   Keep the `A ± delta` skew — that's real inventory management.
+3. **Drop the `🎲` log line** along with the inflation block.
+4. **Leave balance_factor / intensity_label intact** — it's just a
+   display prop, no runtime behaviour hangs off it beyond the
+   banner.
+5. **Keep** `edge_threshold`, `spread_threshold`, `target_spread`,
+   `stop_before_end_ms`, `refresh_interval_ms`, `trade_cooldown`
+   — these are the honest market-making dials.
+
+With those four edits, the bot runs the same strategy without
+the manipulative price-inflation and obfuscated-size layers.
