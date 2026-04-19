@@ -486,7 +486,31 @@ fn place_batch_buy_orders(cfg: &BotConfig, ask: f64, bid: f64, pos: f64) {
 }
 ```
 
-## 12. Open items (not blocking the rewrite)
+## 11b. max_position_size enforcement (spread_capture side)
+
+`run_side_capture` (a closure inside `run_spread_capture_loop`)
+contains the position-cap gate. At 0x0e0a72..0x0e0a8b the format
+arguments for the "At max position" log are loaded:
+
+```
+e0a72: lea 0x210(%rbx), %rax    ; ptr to max_position_size (f64)
+e0a79: lea 0x80(%rbx),  %rcx    ; ptr to up_position      (f64)
+e0a80: lea 0xa0(%rbx),  %rdx    ; ptr to down_position    (f64)
+e0a87: mov 0x60(%rbx),  %rsi    ; String ptr (slug)
+e0a8b: add $0x18, %rsi          ;   ... +24 = .ptr field
+```
+
+So the spread-capture state struct holds:
+- per-side position counters at offsets 0x80 (UP) and 0xa0 (DOWN)
+- `BotConfig.max_position_size` mirrored / referenced at 0x210
+- the slug String at 0x60
+
+The gate fires when `max(up_pos, down_pos) >= max_position_size`,
+and the bot waits for a sell-side fill before posting more buys.
+This is the only pre-trade size cap besides the per-batch
+`max_buy_order_size`.
+
+
 
 - Exact `inventory_skew` multiplier role — confirmed to be an f64
   config field but its usage inside the batch sizing formula is
