@@ -94,7 +94,109 @@ So `balance_factor` is the primary "gamble-level" dial in the
 config. The name "enable_gamble" (see §4) is a SEPARATE field, used
 differently.
 
-## 3. Sizing formula (place_batch_buy_orders, 0xc5498..0xc5550)
+## 3. Sizing formula (place_batch_buy_orders — TWO-PASS, fully decoded)
+
+The sizing logic in `place_batch_buy_orders` is split across two
+non-adjacent code regions:
+
+### Pass A — deterministic skew + clamp (0x0c5498..0x0c5582)
+
+```
+c54bc: mov  0x30(%rbx), %rdi              ; load TradingClient ref
+c54c0: call get_position(rdi)             ; → (xmm0, xmm1) = (yes_pos, no_pos)
+c54c5: movsd %xmm0, (%rbx)
+c54c9: movsd %xmm1, 0x8(%rbx)             ; store positions back to state
+c54ce: mov  0x30(%rbx), %rbx              ; rbx = config (chained pointer)
+c54d2: movsd 0x160(%rbx), %xmm2           ; xmm2 = cfg.inventory_skew
+c54de: ucomisd %xmm2, xmm3=0              ; if skew <= 0:
+c54eb: jae  c55be                         ;   take "no skew" path (xmm0 := A)
+c5503: subsd %xmm0, %xmm1                 ; xmm1 = no_pos - yes_pos
+c5507: mulsd %xmm1, %xmm2                 ; xmm2 = skew * (no - yes)
+c550b: mulsd 0x6caba8 (=0.5), %xmm2       ; xmm2 = skew * (no - yes) * 0.5  = delta
+c5513: movapd %xmm4, %xmm1                ; xmm4 holds A = max_buy_order_size
+c5517: addsd  %xmm2, %xmm1                ; xmm1 = A + delta   (yes_target)
+c551b: subsd  %xmm2, %xmm4                ; xmm4 = A - delta   (no_target)
+c5531: unpcklpd %xmm1, %xmm4              ; pack (no_t, yes_t)
+c5535: maxpd  zero, packed                ; clamp lower → 0
+c5541: minpd  2A_packed, packed           ; clamp upper → 2A
+c5555: call round (lower lane)            ; round(no_target)
+c5572: call round (upper lane)            ; round(yes_target)
+```
+
+Result: `(yes_target, no_target)` as **rounded** non-negative f64s
+≤ `2 * cfg.max_buy_order_size`.
+
+So the deterministic skew is exactly:
+```rust
+let A     = cfg.max_buy_order_size;
+let skew  = cfg.inventory_skew;            // 0.0 = balanced, >0 = skew
+let delta = skew * (no_pos - yes_pos) * 0.5;
+let mut yes_target = (A + delta).clamp(0.0, 2.0 * A).round();
+let mut no_target  = (A - delta).clamp(0.0, 2.0 * A).round();
+```
+
+Note: when **already long YES** (yes_pos > no_pos), `delta < 0`, so
+yes_target shrinks and no_target grows — i.e. `inventory_skew`
+**rebalances away from the heavier side**.
+
+### Pass B — two-roll randomisation (0x0c7922..0x0c79aa)
+
+Roughly 0x2400 bytes downstream (after the "Position: UP=…" log
+line and some allocations are freed):
+
+```
+c7922: movsd 0x6cabb8 (=1.0), %xmm1       ; upper bound
+c7929: xorpd %xmm0, %xmm0                 ; lower bound = 0
+c7931: call rand::gen_range(0.0, 1.0)     ; xmm0 = r1 ∈ [0,1)
+c7936: movsd %xmm0, 0x120(%rsp)           ; save r1
+c7949: ; (load 1.0 / 0.0 again)
+c795e: call rand::gen_range(0.0, 1.0)     ; xmm0 = r2 ∈ [0,1)
+c7963: movsd %xmm0, 0x160(%rsp)           ; save r2
+c7974: movsd 0x120(%rsp), %xmm0           ; r1
+c797d: mulsd (rax), %xmm0                 ; r1 * yes_target
+c7988: call round                         ; → yes_actual
+c799b: movsd 0x160(%rsp), %xmm0           ; r2
+c79a4: mulsd (rax), %xmm0                 ; r2 * no_target
+c79a8: call round                         ; → no_actual
+```
+
+Final orders sent: `yes_actual` shares for YES, `no_actual` shares
+for NO. Expected fill per side = `target / 2`; over many batches
+the bot delivers ~half its nominal max size on average, with
+high variance. **This pass has no separate enable flag in the
+disassembly window** — it always runs in the dutch-book path.
+The `enable_gamble` bool only gates the *spread-reducer*
+(§5/§10), not this size-randomiser.
+
+| address | role                                    |
+|---------|-----------------------------------------|
+| 0x0c5498 | sizing entry — deterministic pass start |
+| 0x0c5503 | inventory_skew × position-delta multiply |
+| 0x0c550b | × 0.5 multiplier (`.rodata:0x6caba8`)   |
+| 0x0c5535/41 | maxpd/minpd clamp to [0, 2A]         |
+| 0x0c7931 | gen_range #1 (yes-side roll)            |
+| 0x0c795e | gen_range #2 (no-side roll)             |
+
+So the verified formula (replacing the earlier inferred one in §11):
+
+```rust
+let A        = cfg.max_buy_order_size;
+let (yes_pos, no_pos) = client.get_position();
+let delta    = cfg.inventory_skew * (no_pos - yes_pos) * 0.5;
+let yes_target = (A + delta).clamp(0.0, 2.0 * A).round();
+let no_target  = (A - delta).clamp(0.0, 2.0 * A).round();
+// log "Position: UP={yes_pos}, DOWN={no_pos}, max=…, slug=…"
+let mut rng = rand::thread_rng();
+let yes_actual = (rng.gen_range(0.0..1.0) * yes_target).round() as u64;
+let no_actual  = (rng.gen_range(0.0..1.0) * no_target ).round() as u64;
+```
+
+Confirmed: `cfg.inventory_skew` lives at struct offset **0x160** of
+the chained config pointer (BotConfig is embedded in a parent
+state struct). When `inventory_skew == 0`, the bot quotes A on
+both sides regardless of position — the "no rebalancing" mode.
+
+## 3-old. Original (now-superseded) sizing summary
 
 Observed SSE2 arithmetic produces two target sizes per batch from a
 shared base A, skewed by the signed book-imbalance, clamped to
