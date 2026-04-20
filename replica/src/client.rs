@@ -217,6 +217,7 @@ impl TradingClient {
         };
         let body = serde_json::to_string(&envelope)
             .map_err(|e| ClientError::Other(e.to_string()))?;
+        tracing::info!(target: "order_body", "{body}");
         let headers = l2_headers(
             self.maker,
             &creds,
