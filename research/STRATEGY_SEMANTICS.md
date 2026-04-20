@@ -3060,3 +3060,195 @@ Specifically:
 "substantively but not fully" toward "substantively and mostly"
 for Bucket A residuals; Bucket B (the seller's private edge)
 remains closed and unrecoverable from artifact alone.
+
+---
+
+## §33 — Third deep-dive pass: blocking residuals closed
+
+This pass targeted the three gaps §32.6 left marked as "blocking
+a replica." All three landed with static-only evidence. Dumps in
+`/tmp/fx/pivot_scan.txt`, `/tmp/fx/spreadcfg_fields.txt`,
+`/tmp/fx/register_order.txt`, `/tmp/fx/clob_rodata.txt`.
+
+### 33.1 — BUY↔SELL pivot comparator (run_side_capture)
+
+**Pinned at 0xdc931:**
+
+```
+dc916:  movsd  0x130(%rbx), %xmm0        ; net_position (f64)
+dc922:  movsd  0x1a8(%rsp), %xmm1        ; max_position_size (f64, stack temp)
+dc931:  ucomisd %xmm1, %xmm0
+dc935:  jbe    0xdca2e                   ; SKIP: no rebalance needed
+  ; fall-through: rebalance path
+dc93b:  subsd  %xmm1, %xmm0              ; surplus = |net_pos| − max_pos
+dc93f:  movsd  %xmm0, 0x268(%rbx)        ; cache surplus for later state
+```
+
+Semantics:
+
+- The decision is **not** "flip sides when fills hit N." It is
+  "if `|net_position|` exceeds `max_position_size`, reduce
+  inventory by emitting the opposite side." The sign of
+  `net_position` at `rbx+0x130` drives which direction:
+    - `net_position < 0` → state 8 (EMIT BUY, reduce short)
+    - `net_position > 0` → state 15 (EMIT SELL, reduce long)
+- The `max_position_size` operand arrives via `rsp+0x1a8`, meaning
+  it was spilled to the closure's stack frame from a caller or an
+  earlier load. It is not read directly from `BotConfig+0xa0` at
+  this site, which is why §31/§32 couldn't find it there.
+- The surplus stored at `rbx+0x268` is later consumed by the
+  `target_spread` decay update (§31) — the urgency ramp is
+  literally "how far underwater am I on inventory."
+
+This closes the largest structural gap. A replica that honors:
+`if |net_pos| > max_pos then emit opposite_side with size ≈
+min(surplus, clip_size)` will reproduce the observed
+BUY/SELL alternation pattern.
+
+### 33.2 — SpreadConfig layout (rbx+0x60, size 0x70)
+
+Evidence-weighted offset table (strong = serde string + use site;
+medium = multiple use sites; weak = init-only, no readers):
+
+| Offset | Type | Name                      | Weight |
+|--------|------|---------------------------|--------|
+| +0x00  | f64? | [unread, init from xmm3]  | weak   |
+| +0x08  | f64? | [unread, init from xmm3]  | weak   |
+| +0x10  | f64  | order_size                | medium |
+| +0x18  | f64? | [unread, init from xmm4]  | weak   |
+| +0x20  | f64  | edge_threshold            | strong |
+| +0x28  | f64  | target_spread (decaying)  | strong |
+| +0x30  | f64? | [unread, init from xmm6]  | weak   |
+| +0x38  | u8   | trade_side (mode flag)    | strong |
+| +0x40..+0x6f | —  | [unread, bulk xmm init]   | weak   |
+
+Notes:
+
+- The agent that mapped this layout flagged `trade_side@+0x38`
+  as "the BUY/SELL pivot gate." That is a **partial overclaim**
+  and must not be accepted uncritically. The comparator at
+  `0xdcc3a` (`cmpb $0x0, 0x38(%r12)`) is a **static mode
+  selector** (e.g. "is this instance configured to make both
+  sides vs one side only"), not the dynamic per-tick pivot.
+  The dynamic pivot is 33.1's `ucomisd` at 0xdc931. The two are
+  compatible: `trade_side` decides whether the 23-state machine
+  is allowed to emit the opposite leg at all; the 0xdc931
+  comparator decides when it fires within that allowance.
+- The eight "weak" offsets inside the 0x70-byte struct mirror
+  the `enable_gamble` pattern: written once during deserialize,
+  never consumed in the hot path. Candidates by name (from
+  serde rodata, assignment unproven): `refresh_interval_ms`,
+  `inventory_skew`, `spread_reducer_value`, plus padding.
+- `order_size@+0x10` has two read sites (0xda047, 0xdf7a6) —
+  it is the per-clip quantity consumed by `place_single_order`
+  arg 3. Confirming this closes the clip-size question that
+  §32 left open.
+
+### 33.3 — register_order wire format
+
+Traced from entry 0xe2825 to POST site. Full 12-field table:
+
+| Field          | Source                         | Evidence         |
+|----------------|--------------------------------|------------------|
+| salt           | fresh, getrandom() syscall     | per-call         |
+| maker          | TradingClient+0x1b8            | cached at init   |
+| signer         | TradingClient+0x1b8 (same)     | cached at init   |
+| taker          | zero address                   | constant         |
+| tokenId        | caller arg (%rdx)              | from pso         |
+| makerAmount    | caller arg (%rsi)              | from pso         |
+| takerAmount    | caller stack[0x8]              | from pso         |
+| expiration     | SystemTime::now() + fixed_win  | GTD              |
+| nonce          | TradingClient+0x1a8 (atomic)   | in-mem counter   |
+| feeRateBps     | FeeRateResponse cache per mkt  | API lookup       |
+| side           | caller arg (%cl)               | 0=BUY,1=SELL     |
+| signatureType  | sign_typed_data (EIP-712)      | alloy_signer     |
+
+Network path:
+
+```
+POST https://clob.polymarket.com/data/orders
+EIP-712 domain:
+  name              = "Polymarket CTF Exchange"
+  version           = "1"
+  chainId           = 137
+  verifyingContract = 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
+```
+
+**Operational defect worth naming:** the nonce counter at
+`TradingClient+0x1a8` is atomic in-memory but **never persisted**.
+A crash or restart resets it to zero. The CLOB will reject
+duplicate-nonce orders from the same maker until the counter
+climbs back above the highest previously-seen value. This is a
+real bug in the seller's bot, not just a concern for replicas.
+If you deploy this artifact as-is, expect a rejection storm on
+every restart until the counter re-overtakes historical high.
+A replica should persist nonce to disk on every increment, or at
+least on a 1-second flush cadence.
+
+### 33.4 — Residuals after this pass
+
+**Closed in §33:**
+- BUY↔SELL pivot comparator (Bucket A, was blocking)
+- SpreadConfig field layout (Bucket A, was blocking)
+- register_order wire format (Bucket A, was blocking)
+
+**Still open, but non-blocking for a replica:**
+- Dashboard/radar client JS bundle — intact, not deobfuscated;
+  not required for the engine.
+- Exfil HMAC key derivation — structure proven, exact key
+  schedule still inferred from 3 init-time readers.
+- Eight weak-weighted SpreadConfig offsets — named from serde
+  strings but never read in the hot path; almost certainly
+  decorative like `enable_gamble`.
+
+**Correction against §32.6 inferences:**
+- §32.6 said "max_position_size at BotConfig+0xa0 is not the
+  gate." Correct — but the gate IS a `max_position_size` value,
+  just loaded from a stack temp (rsp+0x1a8) rather than directly
+  from BotConfig. Likely the BotConfig load happens earlier in a
+  different closure frame and is spilled into this frame's stack
+  at closure construction. Mechanism confirmed, offset path
+  re-routed.
+
+### 33.5 — Replica readiness assessment
+
+A from-spec replica is now **buildable without the binary**:
+
+1. BotConfig proven layout from §31 → map to a Rust struct.
+2. SpreadConfig layout from 33.2 → sub-struct with 4 live fields
+   (order_size, edge_threshold, target_spread, trade_side) and
+   ~8 fields that can be initialized to any value without
+   behavioral change.
+3. Pivot comparator from 33.1 → replica emit loop:
+   ```
+   if trade_side allows both sides {
+     if net_position.abs() > max_position_size {
+       let side = if net_position > 0 { SELL } else { BUY };
+       let surplus = net_position.abs() - max_position_size;
+       target_spread = max(0, target_spread - surplus);
+       emit_order(side, min(surplus, order_size));
+     }
+   }
+   ```
+4. register_order from 33.3 → straight Polymarket CLOB
+   client code against the documented EIP-712 domain, with
+   nonce persisted to disk.
+5. Spread-quoting urgency (§31) → target_spread decays with
+   surplus; base edge_threshold + target_spread gates entry.
+
+Confidence that this replica matches observed behavior on
+market replays: **~85%**. Gaps are the decorative fields and
+the exfil HMAC key schedule — neither alters trading behavior.
+
+Confidence that this replica recovers the **seller's edge**:
+**still 0%**. The edge — if any — is in parameter choice
+(`max_position_size`, `order_size`, `edge_threshold`, cooldowns)
+and market selection, neither of which lives in the binary. The
+artifact is a generic market-maker quoter with urgency-decaying
+entry. Anyone can run it; nobody gets paid for running it
+without the meta-strategy that was never sold.
+
+**One-sentence delta from §32**: all three Bucket-A blockers
+are closed; the bot is now reproducible from spec; Bucket B
+(the seller's edge) remains exactly as unrecoverable as it
+was on day one.
