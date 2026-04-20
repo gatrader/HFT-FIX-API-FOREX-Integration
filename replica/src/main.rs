@@ -66,6 +66,16 @@ enum Cmd {
         /// Fee rate in basis points (fetch from CLOB before running).
         #[arg(long, default_value_t = 0)]
         fee_rate_bps: u32,
+        /// Number of submits to run in THIS process. Default 1
+        /// preserves original single-shot behavior. Use >1 for
+        /// latency benchmarks — the HTTP keepalive pool stays
+        /// warm across iterations, which is the whole point.
+        #[arg(long, default_value_t = 1)]
+        iterations: u32,
+        /// Delay between iterations in milliseconds. Ignored when
+        /// iterations == 1.
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
     },
 }
 
@@ -105,7 +115,10 @@ async fn main() -> Result<()> {
             run_one(&cfg, &client, token, net_position).await
         }
 
-        Cmd::Canary { config, token_id, net_position, fee_rate_bps } => {
+        Cmd::Canary {
+            config, token_id, net_position, fee_rate_bps,
+            iterations, interval_ms,
+        } => {
             let (cfg, token) = load_config(&config, &token_id)?;
             if cfg.dry_run {
                 anyhow::bail!(
@@ -116,7 +129,33 @@ async fn main() -> Result<()> {
                 &cli.key, cli.nonce, false, fee_rate_bps,
             )?;
             load_creds_into(&cli.creds, &client)?;
-            run_one(&cfg, &client, token, net_position).await
+            // Single TradingClient = single reqwest::Client = shared
+            // HTTP keepalive pool across all iterations. That's what
+            // lets the benchmark observe the patch #3 connection-
+            // reuse win; spawning the binary 50 times from a shell
+            // for-loop would throw the pool away each time.
+            for i in 1..=iterations {
+                tracing::info!(
+                    target: "canary_iter",
+                    iteration = i, total = iterations,
+                    "iteration start"
+                );
+                if let Err(e) = run_one(&cfg, &client, token, net_position).await {
+                    // Keep going so we still collect N hotpath samples
+                    // even if one submit is rejected (rate limit, etc.).
+                    tracing::error!(
+                        target: "canary_iter",
+                        iteration = i, error = %e,
+                        "iteration failed — continuing"
+                    );
+                }
+                if i < iterations {
+                    tokio::time::sleep(
+                        std::time::Duration::from_millis(interval_ms),
+                    ).await;
+                }
+            }
+            Ok(())
         }
     }
 }
