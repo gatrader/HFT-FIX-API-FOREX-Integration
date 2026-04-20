@@ -51,6 +51,16 @@ pub struct SignedOrder {
     pub signature: String,
 }
 
+/// Outer envelope for POST /order (Polymarket CLOB).
+/// Carries the signed order plus auth ownership + time-in-force.
+#[derive(Serialize)]
+struct OrderEnvelope<'a> {
+    order: &'a SignedOrder,
+    owner: &'a str,
+    #[serde(rename = "orderType")]
+    order_type: &'a str,
+}
+
 pub struct TradingClient {
     signer: Eip712Signer,
     raw_signer: alloy_signer_local::PrivateKeySigner,
@@ -183,10 +193,9 @@ impl TradingClient {
             .map_err(|e| ClientError::Sign(e.to_string()))?;
         let signed = SignedOrder { order, signature: sig };
 
-        let body = serde_json::to_string(&signed)
-            .map_err(|e| ClientError::Other(e.to_string()))?;
-
         if self.dry_run {
+            let body = serde_json::to_string(&signed)
+                .map_err(|e| ClientError::Other(e.to_string()))?;
             tracing::info!(target: "dry_run", "{body}");
             return Ok(());
         }
@@ -201,6 +210,13 @@ impl TradingClient {
                 "no API credentials — call bootstrap() or set_credentials() first"
                     .into(),
             ))?;
+        let envelope = OrderEnvelope {
+            order: &signed,
+            owner: &creds.api_key,
+            order_type: "GTC",
+        };
+        let body = serde_json::to_string(&envelope)
+            .map_err(|e| ClientError::Other(e.to_string()))?;
         let headers = l2_headers(
             self.maker,
             &creds,

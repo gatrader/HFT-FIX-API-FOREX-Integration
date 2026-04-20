@@ -41,7 +41,12 @@ sol! {
 }
 
 /// JSON-wire representation of the signed order.
+///
+/// Field casing + side encoding match Polymarket CLOB's POST /order
+/// schema (camelCase, side as "BUY"/"SELL" string), verified against
+/// the live server's error responses on 2026-04-20.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClobOrder {
     pub salt: String,
     pub maker: Address,
@@ -53,7 +58,7 @@ pub struct ClobOrder {
     pub expiration: String,
     pub nonce: String,
     pub fee_rate_bps: String,
-    pub side: u8,
+    pub side: String,
     pub signature_type: u8,
 }
 
@@ -81,7 +86,10 @@ impl ClobOrder {
             expiration: expiration.to_string(),
             nonce: nonce.to_string(),
             fee_rate_bps: fee_rate_bps.to_string(),
-            side: side.as_u8(),
+            side: match side {
+                Side::Buy => "BUY".into(),
+                Side::Sell => "SELL".into(),
+            },
             signature_type: 0,
         }
     }
@@ -98,7 +106,11 @@ impl ClobOrder {
             expiration: self.expiration.parse().expect("expiration"),
             nonce: self.nonce.parse().expect("nonce"),
             feeRateBps: self.fee_rate_bps.parse().expect("fee_rate_bps"),
-            side: self.side,
+            side: match self.side.as_str() {
+                "BUY" => 0,
+                "SELL" => 1,
+                other => panic!("invalid side str: {other}"),
+            },
             signatureType: self.signature_type,
         }
     }

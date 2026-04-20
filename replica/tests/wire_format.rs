@@ -93,20 +93,20 @@ fn json_wire_shape_matches_polymarket_schema() {
     let order = sample_order(signer.maker());
     let json = serde_json::to_value(&order).unwrap();
 
-    // Field presence check — Polymarket CLOB /data/orders schema.
+    // Field presence check — Polymarket CLOB POST /order schema.
     for f in [
         "salt",
         "maker",
         "signer",
         "taker",
-        "token_id",
-        "maker_amount",
-        "taker_amount",
+        "tokenId",
+        "makerAmount",
+        "takerAmount",
         "expiration",
         "nonce",
-        "fee_rate_bps",
+        "feeRateBps",
         "side",
-        "signature_type",
+        "signatureType",
     ] {
         assert!(
             json.get(f).is_some(),
@@ -114,23 +114,25 @@ fn json_wire_shape_matches_polymarket_schema() {
         );
     }
 
-    // Large numerics must be strings (U256 range); side/sigtype numeric.
+    // Large numerics must be strings (U256 range); sigtype numeric.
     for f in [
         "salt",
-        "token_id",
-        "maker_amount",
-        "taker_amount",
+        "tokenId",
+        "makerAmount",
+        "takerAmount",
         "expiration",
         "nonce",
-        "fee_rate_bps",
+        "feeRateBps",
     ] {
         assert!(
             json[f].is_string(),
             "field {f} must serialize as string (avoids JSON precision loss)"
         );
     }
-    assert!(json["side"].is_number());
-    assert!(json["signature_type"].is_number());
+    // Side is an uppercase string ("BUY"/"SELL") per the live CLOB schema.
+    assert!(json["side"].is_string());
+    assert_eq!(json["side"].as_str().unwrap(), "BUY");
+    assert!(json["signatureType"].is_number());
 
     // Taker must be the zero address (open order, per artifact).
     assert_eq!(
@@ -144,9 +146,9 @@ fn buy_and_sell_produce_distinct_signatures() {
     let signer = Eip712Signer::from_hex(TEST_KEY).unwrap();
     let maker = signer.maker();
     let mut buy = sample_order(maker);
-    buy.side = Side::Buy.as_u8();
+    buy.side = "BUY".into();
     let mut sell = sample_order(maker);
-    sell.side = Side::Sell.as_u8();
+    sell.side = "SELL".into();
 
     let s_buy = signer.sign_order(&buy.to_eip712()).unwrap();
     let s_sell = signer.sign_order(&sell.to_eip712()).unwrap();
