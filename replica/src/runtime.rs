@@ -32,8 +32,10 @@ use alloy_primitives::U256;
 use parking_lot::RwLock;
 use tokio::time::{interval, MissedTickBehavior};
 
+use tokio::sync::mpsc;
+
 use crate::book::BookSnapshot;
-use crate::client::TradingClient;
+use crate::client::{PreparedSubmit, TradingClient};
 use crate::order::Side;
 use crate::state_machine::{Decision, SpreadCapture, Tick};
 
@@ -106,6 +108,23 @@ pub struct RuntimeStats {
     /// Unix ms of the most recent *attempted* submit (regardless of
     /// success). `-1` = never.
     last_submit_unix_ms: AtomicI64,
+
+    // ── PR 4 / submit-decoupling observables ──────────────────────
+    /// Approximate in-flight queue depth. Incremented on successful
+    /// `try_send`, decremented after the worker finishes HTTP.
+    /// Not load-bearing — this is a gauge, not a reservation
+    /// counter. Drift on the order of one in-flight job is fine.
+    queue_depth: AtomicI64,
+    /// Submits rejected because the bounded mpsc was full at
+    /// try_send time. Monotonic.
+    queue_full_drops: AtomicU64,
+    /// Last observed queue wait: µs from `Instant::now()` at enqueue
+    /// to the worker's `recv()`. Dominant term when the queue is
+    /// non-empty; near zero when HTTP keeps up.
+    last_queue_wait_us: AtomicU64,
+    /// Last observed HTTP round-trip in the worker, in µs. Mirrors
+    /// `submit_ms + body_ms` from the `hotpath` trace event.
+    last_http_submit_us: AtomicU64,
 }
 
 impl Default for RuntimeStats {
@@ -117,6 +136,10 @@ impl Default for RuntimeStats {
             throttle_drops: AtomicU64::new(0),
             last_decision_unix_ms: AtomicI64::new(-1),
             last_submit_unix_ms: AtomicI64::new(-1),
+            queue_depth: AtomicI64::new(0),
+            queue_full_drops: AtomicU64::new(0),
+            last_queue_wait_us: AtomicU64::new(0),
+            last_http_submit_us: AtomicU64::new(0),
         }
     }
 }
@@ -139,6 +162,18 @@ impl RuntimeStats {
     }
     pub fn last_submit_age_ms(&self) -> Option<u64> {
         age_from_unix_ms(self.last_submit_unix_ms.load(Ordering::Relaxed))
+    }
+    pub fn queue_depth(&self) -> i64 {
+        self.queue_depth.load(Ordering::Relaxed)
+    }
+    pub fn queue_full_drops(&self) -> u64 {
+        self.queue_full_drops.load(Ordering::Relaxed)
+    }
+    pub fn last_queue_wait_us(&self) -> u64 {
+        self.last_queue_wait_us.load(Ordering::Relaxed)
+    }
+    pub fn last_http_submit_us(&self) -> u64 {
+        self.last_http_submit_us.load(Ordering::Relaxed)
     }
 }
 
@@ -174,6 +209,78 @@ pub fn size_bucket(size: f64, step: f64) -> i64 {
     (size / step).round() as i64
 }
 
+/// One job on the submit queue. Carries the pre-signed order +
+/// a tracing correlator + the enqueue timestamp (so the worker
+/// can attribute queue wait vs HTTP time independently).
+#[derive(Debug)]
+pub struct SubmitJob {
+    pub prepared: PreparedSubmit,
+    pub enqueued_at: Instant,
+}
+
+/// Single-consumer worker that drains `SubmitJob`s off an mpsc
+/// receiver and hands each to `TradingClient::submit_signed`.
+///
+/// Ordering: tokio mpsc is FIFO per-sender, and the runtime loop
+/// is the sole sender, so submits are issued in strict tick order.
+///
+/// Error policy: HTTP errors are logged + swallowed so one bad
+/// submit does not tear down the worker. The runtime loop keeps
+/// ticking regardless.
+pub struct SubmitWorker {
+    client: Arc<TradingClient>,
+    rx: mpsc::Receiver<SubmitJob>,
+    stats: Arc<RuntimeStats>,
+}
+
+impl SubmitWorker {
+    pub fn new(
+        client: Arc<TradingClient>,
+        rx: mpsc::Receiver<SubmitJob>,
+        stats: Arc<RuntimeStats>,
+    ) -> Self {
+        Self { client, rx, stats }
+    }
+
+    /// Runs until the sender half is dropped (Runtime exits) and
+    /// the receiver returns `None`. Under normal operation this
+    /// task is spawned with `tokio::spawn` and lives as long as
+    /// the Runtime task.
+    pub async fn run(mut self) {
+        while let Some(job) = self.rx.recv().await {
+            let wait_us = job.enqueued_at.elapsed().as_micros() as u64;
+            self.stats.last_queue_wait_us.store(wait_us, Ordering::Relaxed);
+
+            let t_http = Instant::now();
+            let result = self
+                .client
+                .submit_signed(
+                    &job.prepared.signed,
+                    job.prepared.request_id,
+                    job.prepared.sign_us,
+                )
+                .await;
+            let http_us = t_http.elapsed().as_micros() as u64;
+            self.stats
+                .last_http_submit_us
+                .store(http_us, Ordering::Relaxed);
+            self.stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
+
+            if let Err(e) = result {
+                tracing::warn!(
+                    target: "submit_worker",
+                    request_id = job.prepared.request_id,
+                    error = %e,
+                    wait_us,
+                    http_us,
+                    "submit_signed failed; continuing"
+                );
+            }
+        }
+        tracing::info!(target: "submit_worker", "queue closed; worker exiting");
+    }
+}
+
 pub struct Runtime {
     cfg: RuntimeConfig,
     sm: SpreadCapture,
@@ -190,6 +297,17 @@ pub struct Runtime {
     /// Rolling window of submit timestamps for the budget gate.
     /// Bounded by `submit_budget_per_sec` + pruning each tick.
     submit_window: RwLock<VecDeque<Instant>>,
+    /// Bounded mpsc sender to the submit worker. When `Some`, the
+    /// runtime loop signs on-tick and hands the result to the
+    /// worker via `try_send` — decision ticks no longer inherit
+    /// HTTP round-trip latency.
+    ///
+    /// When `None`, the loop falls back to the inline REST path
+    /// via `client.place_single_order`. This is the rollback
+    /// surface: if the queue wiring turns out wrong in production,
+    /// omit `with_submit_queue(..)` and the binary reverts to
+    /// byte-identical PR 3 behavior.
+    submit_tx: Option<mpsc::Sender<SubmitJob>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -217,12 +335,20 @@ impl Runtime {
             net_position: RwLock::new(0.0),
             last_submit: RwLock::new(None),
             submit_window: RwLock::new(VecDeque::new()),
+            submit_tx: None,
         }
     }
 
     #[cfg(feature = "ws")]
     pub fn with_ws_stats(mut self, stats: Arc<WsStats>) -> Self {
         self.ws_stats = Some(stats);
+        self
+    }
+
+    /// Route submits through a bounded mpsc to a `SubmitWorker`
+    /// task. Without this, submits go inline (PR 3 behavior).
+    pub fn with_submit_queue(mut self, tx: mpsc::Sender<SubmitJob>) -> Self {
+        self.submit_tx = Some(tx);
         self
     }
 
@@ -384,19 +510,70 @@ impl Runtime {
             EmitDecision::Allowed => {}
         }
 
-        // Attempt the submit. We record the submit timestamp
-        // regardless of the server's answer — from the perspective
-        // of the budget, we already paid the outbound send.
+        // Record the submit *before* we try to enqueue: the budget
+        // and dedup gates have already approved this slot, and we
+        // don't want a transient queue-full to free that slot back.
         self.record_submit(side, price, size, now);
-        if let Err(e) = client
-            .place_single_order(token_id, maker_amount, taker_amount, side)
-            .await
-        {
-            tracing::warn!(
-                target: "runtime",
-                error = %e,
-                "submit failed; budget/dedup advanced anyway"
-            );
+
+        // ── Hot path branch: queued vs inline ─────────────────────
+        if let Some(tx) = &self.submit_tx {
+            // Sign on the runtime tick (CPU-bound, ~µs). The HTTP
+            // round trip happens in the worker so the next decision
+            // tick does not inherit it.
+            let prepared = match client
+                .sign_for_submit(token_id, maker_amount, taker_amount, side)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "runtime",
+                        error = %e,
+                        "sign_for_submit failed; skipping tick"
+                    );
+                    return Ok(());
+                }
+            };
+            let job = SubmitJob { prepared, enqueued_at: Instant::now() };
+            match tx.try_send(job) {
+                Ok(()) => {
+                    self.stats.queue_depth.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.stats
+                        .queue_full_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        target: "submit_queue",
+                        depth = self.stats.queue_depth(),
+                        capacity = tx.max_capacity(),
+                        "queue full; dropping submit (back-pressure)"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Worker died. Counted as a drop so the dashboard
+                    // sees something is wrong; the runtime keeps
+                    // ticking so an operator can intervene.
+                    self.stats
+                        .queue_full_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        target: "submit_queue",
+                        "worker channel closed; submit dropped"
+                    );
+                }
+            }
+        } else {
+            // Inline (REST rollback) path — byte-identical to PR 3.
+            if let Err(e) = client
+                .place_single_order(token_id, maker_amount, taker_amount, side)
+                .await
+            {
+                tracing::warn!(
+                    target: "runtime",
+                    error = %e,
+                    "submit failed; budget/dedup advanced anyway"
+                );
+            }
         }
         Ok(())
     }
@@ -622,5 +799,168 @@ mod tests {
         assert!(stats.last_submit_age_ms().is_none());
         // Decision age WAS recorded.
         assert!(stats.last_decision_age_ms().is_some());
+    }
+
+    // ── PR 4: submit-decoupling tests ─────────────────────────────
+
+    /// When a queue is wired in and capacity is plenty, run_tick
+    /// should sign + try_send (queue_depth advances by 1), without
+    /// blocking on HTTP. The inline submit path must NOT have run.
+    #[tokio::test]
+    async fn run_tick_enqueues_when_queue_present() {
+        use crate::book::BookLevel;
+        use crate::client::TradingClient;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let key = "0000000000000000000000000000000000000000000000000000000000000001";
+        let client = TradingClient::new(key, dir.path().join("nonce"), true, 0)
+            .unwrap();
+        let book = client.book_cache();
+        {
+            let mut b = book.write();
+            b.bids = vec![BookLevel { price: 0.49, size: 100.0 }];
+            b.asks = vec![BookLevel { price: 0.51, size: 100.0 }];
+            b.stamp_now();
+        }
+
+        use crate::config::{SpreadConfig, TradeSideMode};
+        let sc = SpreadConfig {
+            order_size: 1.0,
+            edge_threshold: 0.005,
+            target_spread: 0.005,
+            trade_side: TradeSideMode::Both,
+        };
+        let sm = SpreadCapture::new(sc, 5.0, 0.01, 0.99);
+        let cfg = RuntimeConfig {
+            tick_interval_ms: 150,
+            book_max_age_ms: 60_000,
+            ..RuntimeConfig::default()
+        };
+        let stats = Arc::new(RuntimeStats::default());
+        let (tx, mut rx) = mpsc::channel::<SubmitJob>(8);
+        let mut rt = Runtime::new(cfg, sm, book.clone(), stats.clone())
+            .with_submit_queue(tx);
+        rt.set_net_position(10.0); // force pivot → emit
+
+        rt.run_tick(U256::from(1u64), "1", &client).await.unwrap();
+
+        assert_eq!(stats.queue_depth(), 1, "queue_depth should advance");
+        assert_eq!(stats.queue_full_drops(), 0);
+        // Drain to confirm a real SubmitJob landed.
+        let job = rx.try_recv().expect("expected one queued job");
+        assert!(job.prepared.sign_us > 0);
+        assert!(!job.prepared.signed.signature.is_empty());
+    }
+
+    /// When the queue is full, try_send should fail Fast → drop the
+    /// submit + bump queue_full_drops + warn-log. Critically, the
+    /// runtime tick must still return Ok in bounded time (no block).
+    #[tokio::test]
+    async fn run_tick_drops_when_queue_full() {
+        use crate::book::BookLevel;
+        use crate::client::TradingClient;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let key = "0000000000000000000000000000000000000000000000000000000000000001";
+        let client = TradingClient::new(key, dir.path().join("nonce"), true, 0)
+            .unwrap();
+        let book = client.book_cache();
+        {
+            let mut b = book.write();
+            b.bids = vec![BookLevel { price: 0.49, size: 100.0 }];
+            b.asks = vec![BookLevel { price: 0.51, size: 100.0 }];
+            b.stamp_now();
+        }
+
+        use crate::config::{SpreadConfig, TradeSideMode};
+        let sc = SpreadConfig {
+            order_size: 1.0,
+            edge_threshold: 0.005,
+            target_spread: 0.005,
+            trade_side: TradeSideMode::Both,
+        };
+        let sm = SpreadCapture::new(sc, 5.0, 0.01, 0.99);
+        let cfg = RuntimeConfig {
+            tick_interval_ms: 150,
+            book_max_age_ms: 60_000,
+            // Big budget so dedup/throttle don't suppress before
+            // we get a chance to overflow the queue.
+            submit_budget_per_sec: 1_000,
+            dedup_window_ms: 0,
+            ..RuntimeConfig::default()
+        };
+        let stats = Arc::new(RuntimeStats::default());
+        // Capacity 1 → first tick fills it, second tick must drop.
+        let (tx, _rx_held) = mpsc::channel::<SubmitJob>(1);
+        let mut rt = Runtime::new(cfg, sm, book.clone(), stats.clone())
+            .with_submit_queue(tx);
+        rt.set_net_position(10.0);
+
+        // First tick lands in the queue.
+        rt.run_tick(U256::from(1u64), "1", &client).await.unwrap();
+        assert_eq!(stats.queue_depth(), 1);
+        assert_eq!(stats.queue_full_drops(), 0);
+
+        // Second tick: queue full → drop. Tick still returns
+        // promptly (no HTTP, no await).
+        let t0 = Instant::now();
+        rt.run_tick(U256::from(1u64), "1", &client).await.unwrap();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "full-queue tick should not block: took {elapsed:?}"
+        );
+        assert_eq!(stats.queue_full_drops(), 1);
+        assert_eq!(stats.queue_depth(), 1, "depth unchanged on drop");
+    }
+
+    /// SubmitWorker drains the queue and decrements queue_depth.
+    /// Uses dry_run=true so submit_signed short-circuits without
+    /// touching the network.
+    #[tokio::test]
+    async fn submit_worker_drains_and_decrements_depth() {
+        use crate::client::TradingClient;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let key = "0000000000000000000000000000000000000000000000000000000000000001";
+        let client = Arc::new(
+            TradingClient::new(key, dir.path().join("nonce"), true, 0).unwrap(),
+        );
+        let stats = Arc::new(RuntimeStats::default());
+        let (tx, rx) = mpsc::channel::<SubmitJob>(4);
+
+        // Pre-stage three jobs as if the runtime had enqueued them.
+        for _ in 0..3 {
+            let prepared = client
+                .sign_for_submit(
+                    U256::from(7u64),
+                    U256::from(1_000u64),
+                    U256::from(500u64),
+                    Side::Sell,
+                )
+                .unwrap();
+            tx.try_send(SubmitJob {
+                prepared,
+                enqueued_at: Instant::now(),
+            })
+            .unwrap();
+            stats.queue_depth.fetch_add(1, Ordering::Relaxed);
+        }
+        assert_eq!(stats.queue_depth(), 3);
+
+        // Spawn worker, drop the sender so it exits cleanly when drained.
+        let worker = SubmitWorker::new(client.clone(), rx, stats.clone());
+        let handle = tokio::spawn(worker.run());
+        drop(tx);
+        handle.await.expect("worker exits cleanly");
+
+        assert_eq!(stats.queue_depth(), 0, "worker decremented depth to 0");
+        // last_http_submit_us should be set (dry_run path is fast
+        // but still measurable as elapsed > 0).
+        // Note: dry_run can complete in <1µs on fast machines,
+        // so we only assert the side effect ran (queue drained).
     }
 }

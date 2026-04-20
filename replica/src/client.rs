@@ -43,7 +43,7 @@ impl From<anyhow::Error> for ClientError {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SignedOrder {
     #[serde(flatten)]
     pub order: ClobOrder,
@@ -218,6 +218,27 @@ impl TradingClient {
         taker_amount: U256,
         side: Side,
     ) -> Result<(), ClientError> {
+        let prepared = self
+            .sign_for_submit(token_id, maker_amount, taker_amount, side)?;
+        self.submit_signed(&prepared.signed, prepared.request_id, prepared.sign_us)
+            .await
+    }
+
+    /// Sign-only half of the submit path — pure compute, no I/O.
+    ///
+    /// Split out of `place_single_order` for PR 4 (submit decoupling)
+    /// so the runtime loop can sign on its own tick and hand the
+    /// bytes to a worker via bounded mpsc rather than awaiting the
+    /// HTTP round trip inline. The returned `PreparedSubmit` is the
+    /// exact argument shape `submit_signed` expects; passing it
+    /// around is the "job" that crosses the queue boundary.
+    pub fn sign_for_submit(
+        &self,
+        token_id: U256,
+        maker_amount: U256,
+        taker_amount: U256,
+        side: Side,
+    ) -> Result<PreparedSubmit, ClientError> {
         let request_id = self.next_request_id();
         let order = ClobOrder::new(
             Self::fresh_salt(),
@@ -230,17 +251,30 @@ impl TradingClient {
             U256::from(self.fee_rate_bps),
             side,
         );
-
         let t_sign = Instant::now();
         let sig = self
             .signer
             .sign_order(&order.to_eip712())
             .map_err(|e| ClientError::Sign(e.to_string()))?;
         let sign_us = t_sign.elapsed().as_micros() as u64;
-        let signed = SignedOrder { order, signature: sig };
+        Ok(PreparedSubmit {
+            signed: SignedOrder { order, signature: sig },
+            request_id,
+            sign_us,
+        })
+    }
 
+    /// Submit-only half — pure I/O. Callable from a worker task
+    /// with a pre-signed order. Preserves the existing `dry_run`
+    /// short-circuit and `hotpath` trace event byte-for-byte.
+    pub async fn submit_signed(
+        &self,
+        signed: &SignedOrder,
+        request_id: u64,
+        sign_us: u64,
+    ) -> Result<(), ClientError> {
         if self.dry_run {
-            let body = serde_json::to_string(&signed)
+            let body = serde_json::to_string(signed)
                 .map_err(|e| ClientError::Other(e.to_string()))?;
             tracing::info!(target: "dry_run", "{body}");
             return Ok(());
@@ -256,7 +290,7 @@ impl TradingClient {
                     .into(),
             ))?;
         let envelope = OrderEnvelope {
-            order: &signed,
+            order: signed,
             owner: &creds.api_key,
             order_type: "GTC",
             post_only: false,
@@ -315,4 +349,13 @@ impl TradingClient {
         tracing::info!(target: "order_response", status = %status, body = %body_text);
         Ok(())
     }
+}
+
+/// Output of `sign_for_submit` — everything a worker needs to
+/// call `submit_signed` without reaching back into the hot path.
+#[derive(Clone, Debug)]
+pub struct PreparedSubmit {
+    pub signed: SignedOrder,
+    pub request_id: u64,
+    pub sign_us: u64,
 }

@@ -19,7 +19,9 @@ use arbigab_replica::auth::ApiCredentials;
 use arbigab_replica::client::TradingClient;
 use arbigab_replica::config::{BotConfig, SpreadConfig};
 use arbigab_replica::order::{pick_side, Side};
-use arbigab_replica::runtime::{Runtime, RuntimeConfig, RuntimeStats};
+use arbigab_replica::runtime::{
+    Runtime, RuntimeConfig, RuntimeStats, SubmitWorker,
+};
 use arbigab_replica::state_machine::{encode_amounts, SpreadCapture};
 
 #[derive(Parser)]
@@ -115,6 +117,17 @@ enum Cmd {
         /// When false, REST fetch_book is used on every stale tick.
         #[arg(long, default_value_t = false)]
         realtime: bool,
+        /// Bounded mpsc capacity between runtime tick and submit
+        /// worker. Larger = more burst tolerance, more memory; the
+        /// budget gate (submit_budget_per_sec) means steady-state
+        /// depth stays small. 32 is comfortable headroom at 5/s.
+        #[arg(long, default_value_t = 32)]
+        submit_queue_capacity: usize,
+        /// Rollback switch: when true, runtime submits inline as in
+        /// PR 3 (decision tick blocks on HTTP). Off by default —
+        /// the whole point of PR 4 is to keep ticks off HTTP.
+        #[arg(long, default_value_t = false)]
+        inline_submit: bool,
     },
 }
 
@@ -173,6 +186,7 @@ async fn main() -> Result<()> {
             tick_interval_ms, book_max_age_ms, dedup_window_ms,
             submit_budget_per_sec, price_bucket, size_bucket,
             duration_secs, realtime,
+            submit_queue_capacity, inline_submit,
         } => {
             use std::sync::Arc;
             use std::time::Duration;
@@ -181,9 +195,11 @@ async fn main() -> Result<()> {
             if cfg.dry_run {
                 anyhow::bail!("runtime refuses to run with dry_run=true");
             }
-            let client = TradingClient::new(
+            // Arc<TradingClient>: shared between runtime tick (sign)
+            // and submit worker (HTTP). Cheap clone.
+            let client = Arc::new(TradingClient::new(
                 &cli.key, cli.nonce, false, fee_rate_bps,
-            )?;
+            )?);
             load_creds_into(&cli.creds, &client)?;
 
             let rt_cfg = RuntimeConfig {
@@ -229,6 +245,28 @@ async fn main() -> Result<()> {
             }
             rt.set_net_position(net_position);
 
+            // ── Submit decoupling (PR 4) ──────────────────────────
+            // Default: bounded mpsc + worker. Rollback: --inline-submit
+            // restores the PR 3 behavior of awaiting HTTP on the tick.
+            if !inline_submit {
+                let (tx, rx) = tokio::sync::mpsc::channel(submit_queue_capacity);
+                let worker = SubmitWorker::new(
+                    client.clone(), rx, stats.clone(),
+                );
+                tokio::spawn(worker.run());
+                rt = rt.with_submit_queue(tx);
+                tracing::info!(
+                    target: "runtime",
+                    capacity = submit_queue_capacity,
+                    "submit worker spawned (queued submit path)"
+                );
+            } else {
+                tracing::warn!(
+                    target: "runtime",
+                    "--inline-submit set: ticks will block on HTTP (PR 3 fallback)"
+                );
+            }
+
             // 1 Hz stats logger — independent cadence from the
             // decision tick so the log isn't N×/sec at 150ms ticks.
             let stats_for_log = stats.clone();
@@ -245,6 +283,10 @@ async fn main() -> Result<()> {
                         drops = stats_for_log.throttle_drops(),
                         last_decision_age_ms = ?stats_for_log.last_decision_age_ms(),
                         last_submit_age_ms = ?stats_for_log.last_submit_age_ms(),
+                        queue_depth = stats_for_log.queue_depth(),
+                        queue_full_drops = stats_for_log.queue_full_drops(),
+                        last_queue_wait_us = stats_for_log.last_queue_wait_us(),
+                        last_http_submit_us = stats_for_log.last_http_submit_us(),
                         book_age_ms = ?b.book_age_ms(),
                         best_bid = ?b.best_bid(),
                         best_ask = ?b.best_ask(),
@@ -253,7 +295,7 @@ async fn main() -> Result<()> {
                 }
             });
 
-            let tick_fut = rt.run_forever(token, token_id.clone(), &client);
+            let tick_fut = rt.run_forever(token, token_id.clone(), &*client);
             if duration_secs == 0 {
                 tick_fut.await?;
             } else {
