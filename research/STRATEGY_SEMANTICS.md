@@ -2844,3 +2844,219 @@ Adding to §29j:
 
 Three of these are easy follow-ups (≤1 hour of agent time each).
 The rest require either more disassembly passes or external data.
+
+---
+
+## 32. Follow-up pass — three residual gaps closed
+
+### 32.1. `enable_gamble` is decorative. Zero readers.
+
+**Ground truth after exhaustive search:** `enable_gamble`
+(BotConfig+0xe5) has **no runtime reader anywhere in the binary**.
+
+- 20 total hits on `0xe5(%r??)` across the 1.66 M-line objdump.
+- The only arbitrage_bot-owned touch is the WRITE at
+  `0x177667: movb $0x1,0xe5(%rbx)` inside
+  `BotConfig::merge_with_args`.
+- All 19 other hits are unrelated structs: tungstenite
+  `WebSocketContext::_write`/`start_send`/`poll_next` (4 hits),
+  rustls drop routines / `KeyScheduleBeforeFinished` / client-hello
+  retry (9 hits — rustls internal state byte).
+- Mirror checks — zero. No `movups 0xe0(…)` into a stack slot
+  followed by a `cmpb` at the +5 adjacent mirror offset anywhere.
+- No `--enable-gamble` CLI flag string in rodata; no
+  `ENABLE_GAMBLE` env var string. Args+0x8b is the serde-present
+  bit from JSON parsing, not a CLI flag.
+
+**Final verdict on enable_gamble**: the field is serialised in and
+out (serde recognises the JSON key) and written by merge_with_args
+when an override is present, but its value is **never consulted by
+any branch, function-pointer dispatch, or store suppression in the
+binary**. Setting it true or false changes nothing in the delivered
+build.
+
+**Implication for the seller-private-edge hypothesis**: this is
+circumstantial but suggestive. A field named `enable_gamble` that
+is fully preserved in the serde layer and CLI layer but has all
+consumers stripped out at codegen is consistent with the seller
+running a private build that retains the consumer, and shipping
+customers a build with the relevant code removed (or
+`#[cfg(feature=…)]`-gated out). Not proof, but it aligns with the
+§27 backdoor pattern — the seller holds back capability, not data.
+
+### 32.2. Side byte PINNED at closure offset +0x2ec
+
+The Side byte lives at **parent-closure +0x2ec** — the **high byte
+of the `movw` at +0x2eb**. The paired word simultaneously writes
+the async sub-state (low byte at +0x2eb) and the Side (high byte
+at +0x2ec).
+
+- `0xde731: movw $0x0000, 0x2eb(%rbx)` → async_state=0, **Side=0
+  (BUY)**.
+- `0xdf7da: movw $0x0100, 0x2eb(%rbx)` → async_state=0, **Side=1
+  (SELL)**.
+
+The callee (`place_single_order`, 0xe1a10) receives the Side via
+the closure-capture mechanism. The parent passes
+`lea 0x268(%rbx),%r15` → %rsi at 0xde749 and 0xdf7f2, so:
+
+- Callee-frame offset = parent-frame +0x2ec − 0x268 = **+0x84**.
+- On state-0 entry of the callee (0xe1a6d) the Side at +0x84 is
+  mirrored to a working slot at **+0x80** and subsequently passed
+  as the 4th argument (%cl) into `register_order` at 0xe2825.
+
+**Falsified candidates**:
+- `0xe2180: movb $0x1, 0x144(%rbx)` — Option/enum discriminant
+  tag in an OrderBuilder argument struct at 0x88(%rbx); paired
+  with `movb %cl,0x145` and `movb $0,0x146` in a classic
+  Option\<bool\> tick-size layout.
+- `0xe23f5: movb $0x1, 0x81(%rbx)` — unwind-safety drop-guard
+  flag set before a malloc and cleared at 0xe2435 after the
+  allocation succeeds. Prologue at 0xe1a48 zeroes +0x81/+0x82
+  as guard flags. Not Side.
+
+**Correction to §28b/§30**: the prior claim
+"Side=Buy hardcoded at 0xdf7da via `movw $0x100,0x2eb(%rbx)`" was
+correct on byte values but misattributed the offset — the Side is
+at +0x2ec, not +0x2eb. +0x2eb is the paired async sub-state
+discriminant. The atomic-word write pattern is deliberate: a single
+`movw` sets up both the nested future's state AND the Side in one
+store.
+
+### 32.3. `max_position_size` is NOT the spread_capture pivot
+
+The buy→sell transition is not gated on a direct read of
+`BotConfig+0xa0`. There is **no `ucomisd 0xa0(%rax)` anywhere in
+`run_side_capture`** when %rax is the BotConfig pointer.
+
+More importantly, the agent trace revealed that `rbx+0x60` inside
+`run_side_capture` is **NOT a BotConfig pointer** — it is a
+pointer to a separate `SpreadConfig` / `SpreadCaptureConfig`
+sub-struct. The field at `rbx+0x60+0x28` that we've been calling
+`target_spread` is at offset +0x28 OF THAT SUB-STRUCT, not of
+BotConfig. BotConfig itself does contain `target_spread` at +0xc0
+(proven by merge_with_args behaviour of field layout), but the
+spread_capture closure is given a compacted sub-config object.
+
+**Consequence — revised spread_capture config access pattern:**
+
+- `rbx+0x60` = pointer to `SpreadConfig` sub-struct (24-40 bytes).
+  Fields include:
+  - `SpreadConfig+0x28`: working-copy `target_spread` (f64, decays)
+  - `SpreadConfig+0x18`: price bound (read at 0xdf5f0 ucomisd)
+  - `SpreadConfig+0x30`: trade cooldown (read at 0xda4fd cmp)
+  - other slots used but not exhaustively labelled
+- `rbx+0x178` = pointer to market/params struct (read at 0xde535)
+  - `+0x20`: base edge threshold (read at 0xde53c movsd)
+
+So the `SpreadConfig` object is constructed at `run_single_market`
+dispatch time (around 0xe87ef) by copying **BotConfig+0x80,
++0xa8..+0xb7 (16B), +0xb8, +0xc0** into a freshly-allocated
+sub-struct. That's the `spread_capture` branch's config slice.
+
+The `run_trading_loop` branch (the other arm at 0xe86a3–0xe86cd)
+reads a DIFFERENT field bundle: `+0x68 (spread_threshold)`,
+`+0x70 (trade_cooldown)`, `+0x90/+0x98 (min_price/max_price)`,
+`+0xa0 (max_position_size)`. **None of those are consumed inside
+run_side_capture.**
+
+**What this means for §31.1's offset map:**
+- The proven offsets from merge_with_args remain proven.
+- But the **active-field partition** is split: `run_trading_loop`
+  uses the lower-numbered f64 bundle; `run_spread_capture_loop`
+  uses a higher-numbered bundle compacted into a sub-config.
+- `max_position_size` at +0xa0 is active only in `run_trading_loop`.
+- Spread_capture's buy→sell pivot must therefore gate on a
+  DIFFERENT value — possibly a mirrored copy of max_position_size
+  inside the SpreadConfig, or on a fill-count in PositionState, or
+  on the flag bytes at `rbx+0x262`/`rbx+0x263`. **This specific
+  pivot is still not located.**
+
+### 32.4. Field-liveness table — post §32
+
+| Field | Offset | Consumer path | Evidence |
+|-------|--------|---------------|----------|
+| spread_threshold | +0x68 | **run_trading_loop only** — 0xe86a3 | confirmed |
+| trade_cooldown | +0x70 | **run_trading_loop only** — 0xe86a8 | confirmed |
+| balance_factor | +0x78 | banner-only (§2) | prior |
+| stop_before_end_ms | +0x80 | run_user_ws_monitor only | §28d |
+| min_price | +0x90 | **run_trading_loop only** — 0xe86cd | confirmed |
+| max_price | +0x98 | **run_trading_loop only** — 0xe86cd | confirmed |
+| max_position_size | +0xa0 | **run_trading_loop only** — direct read | confirmed |
+| trade_side (inferred) | +0xa8..+0xc0 | copied into SpreadConfig for run_side_capture | prior |
+| target_spread | +0xc0 | run_side_capture (copied to SpreadConfig+0x28) | §31.3 |
+| spread_reducer_probability.Some | +0xd0 | run_trading_loop reducer gate @ 0xc1a1f | §31 |
+| interval_minutes | +0xe0 | outer loop bound | merge_with_args |
+| dry_run | +0xe4 | banner (real gate at 0xe1a8e) | prior |
+| **enable_gamble** | +0xe5 | **DECORATIVE — zero readers** | §32.1 |
+| log_price | +0xe6 | log verbosity | merge_with_args |
+| cancel_orders_on_start | +0xe8 | run_trading_loop+0x719 cancel gate | prior |
+
+### 32.5. The two code paths are almost disjoint
+
+`run_trading_loop` and `run_spread_capture_loop` consume
+**largely non-overlapping** slices of BotConfig. Practical
+consequence for a clone:
+
+- If you're replicating the spread_capture path: only these
+  BotConfig fields matter at runtime — `target_spread` (+0xc0),
+  `trade_side` (+0xa8), and the `+0x80` value, plus whatever the
+  +0xa8..+0xb7 and +0xb8 slots hold. The trading_loop-specific
+  fields (`spread_threshold`, `trade_cooldown`, `min_price`,
+  `max_price`, `max_position_size`) are not consulted.
+- If you're replicating the trading_loop path: the inverse.
+- Either side can be removed without affecting the other.
+
+**This tightens the clone recipe from §29j**: the cleanest clone is
+to literally delete the `run_trading_loop` branch in `run_single_market`'s
+dispatch and keep only the spread_capture sub-config pack. Users
+never touch the reducer/randomiser/gamble code because the dispatch
+never reaches it.
+
+### 32.6. Residual gaps NOT closed this session
+
+1. **max_position_size-equivalent pivot in spread_capture**. The
+   agent confirmed it's not `BotConfig+0xa0` nor any of the
+   trading_loop-path reads. Candidate: a mirror inside SpreadConfig,
+   or a fill-count read from PositionState. Needs another targeted
+   agent pass on the state 10 → state 15 transition inside the
+   23-state jumptable.
+2. **Full SpreadConfig layout**. We know +0x18, +0x28, +0x30 are
+   used; full struct size and remaining field semantics are not
+   mapped.
+3. **slug / order_size / max_position_size / edge_threshold
+   proven offsets within BotConfig** — still best-guesses from §31.1.
+4. **Dashboard radar client bundle** — Bucket B-adjacent, not
+   attempted this session.
+5. **Whether there are two spawned worker futures or a single
+   23-state closure handling both BUY and SELL** — the Side agent's
+   trace supports the single-closure interpretation (state 8 and
+   state 15 both call `place_single_order` on the same %rbx base),
+   so §31.4's "possibly spawn-per-side" worry appears resolved
+   toward **single closure**. But the `tokio::task::spawn` sites
+   at 0x1a8570 / 0x1b05a0 were not disassembled — they might
+   spawn the closure multiple times rather than splitting it.
+
+### 32.7. Honest audit update
+
+After §32, the recovered+inferred picture of the sold binary is
+**substantially better pinned** than the §30 audit suggested.
+Specifically:
+
+- Confidence on `run_side_capture` control flow: ~**85%** (states,
+  transitions, suspend points, emit sites, cancel sites all mapped).
+- Confidence on `target_spread` semantics: ~**90%** (urgency
+  threshold confirmed).
+- Confidence on `enable_gamble` runtime effect: **~99% that it has
+  NONE** in this build.
+- Confidence on Side-byte location: **100%** (pinned).
+- Confidence on BotConfig field layout: ~**80%** for proven
+  offsets; ~**40%** for inferred offsets.
+- Confidence on whether this is the seller's real edge: **unchanged
+  low** — enable_gamble-decorative finding is new circumstantial
+  support for the "hollowed-shell" hypothesis but not proof.
+
+**One-sentence delta from §30**: the artifact audit moves from
+"substantively but not fully" toward "substantively and mostly"
+for Bucket A residuals; Bucket B (the seller's private edge)
+remains closed and unrecoverable from artifact alone.
