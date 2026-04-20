@@ -79,104 +79,134 @@ impl SpreadCapture {
         &self.spread_cfg
     }
 
-    /// Drives one step of the state machine using the provided
-    /// tick and issuing a side effect through `client` when the
-    /// current state is an EMIT or CANCEL state. Returns the
+    /// Pure decision step — no I/O. Returns what the machine
+    /// has chosen to do this iteration and mutates internal
+    /// state (`target_spread` decay, next state) accordingly.
+    ///
+    /// Split out from `tick` so tests can drive the state
+    /// machine with synthetic data and assert invariants
+    /// without a live `TradingClient`.
+    ///
+    /// Each call conceptually re-enters AwaitBook: any side
+    /// effect from the previous decision (emit / cancel) is
+    /// assumed resolved by the caller before the next tick.
+    pub fn decide(&mut self, tick: &Tick) -> Decision {
+        if self.state == State::Stop {
+            return Decision::Skip;
+        }
+        self.state = State::AwaitBook;
+
+        // Gate (0xde541) — SKIP if observed spread not wide
+        // enough given current urgency.
+        let Some(spread) = tick.book.spread() else {
+            self.state = State::Backoff;
+            return Decision::Skip;
+        };
+        if !self.spread_cfg.gate(spread) {
+            self.state = State::CancelSecondary;
+            return Decision::CancelSecondary;
+        }
+
+        // Pivot (0xdc931) — decides BUY vs SELL or SKIP.
+        let Some((side, surplus)) = pick_side(
+            tick.net_position,
+            self.max_position,
+            self.spread_cfg.trade_side,
+        ) else {
+            self.state = State::CancelPrimary;
+            return Decision::CancelPrimary;
+        };
+
+        // Urgency decay only applied when the pivot actually
+        // identifies surplus (§33 / FINAL_AUDIT §8).
+        self.spread_cfg.decay(surplus);
+
+        let price = match side {
+            Side::Buy => self
+                .min_price
+                .max(tick.book.best_bid().unwrap_or(self.min_price)),
+            Side::Sell => self
+                .max_price
+                .min(tick.book.best_ask().unwrap_or(self.max_price)),
+        };
+        let size = self.spread_cfg.order_size;
+        let (maker_amount, taker_amount) = encode_amounts(side, price, size);
+
+        self.state = match side {
+            Side::Buy => State::EmitBuy,
+            Side::Sell => State::EmitSell,
+        };
+
+        Decision::Emit {
+            side,
+            price,
+            size,
+            maker_amount,
+            taker_amount,
+            surplus,
+        }
+    }
+
+    /// Drives one step of the state machine and dispatches to
+    /// the client when the decision is an EMIT. Returns the
     /// next state.
     pub async fn tick(
         &mut self,
         tick: &Tick,
         client: &TradingClient,
     ) -> anyhow::Result<State> {
-        self.state = match self.state {
-            State::Init => State::AwaitBook,
-
-            State::AwaitBook => {
-                // Gate (0xde541) — SKIP if observed spread not
-                // wide enough given current urgency.
-                let Some(spread) = tick.book.spread() else {
-                    return Ok(self.advance(State::Backoff));
-                };
-                if !self.spread_cfg.gate(spread) {
-                    return Ok(self.advance(State::CancelSecondary));
-                }
-
-                // Pivot (0xdc931) — decides BUY vs SELL.
-                let Some((side, surplus)) = pick_side(
-                    tick.net_position,
-                    self.max_position,
-                    self.spread_cfg.trade_side,
-                ) else {
-                    return Ok(self.advance(State::CancelPrimary));
-                };
-
-                // Urgency decay.
-                self.spread_cfg.decay(surplus);
-
-                match side {
-                    Side::Buy => State::EmitBuy,
-                    Side::Sell => State::EmitSell,
-                }
-            }
-
-            State::EmitBuy => {
-                let price = self.min_price.max(
-                    tick.book.best_bid().unwrap_or(self.min_price),
-                );
-                let size = self.spread_cfg.order_size;
-                let (maker_amount, taker_amount) =
-                    encode_amounts(Side::Buy, price, size);
+        match self.decide(tick) {
+            Decision::Emit {
+                side,
+                maker_amount,
+                taker_amount,
+                ..
+            } => {
                 client
                     .place_single_order(
                         tick.token_id,
                         maker_amount,
                         taker_amount,
-                        Side::Buy,
+                        side,
                     )
                     .await?;
-                State::AwaitBook
+                self.state = State::AwaitBook;
             }
-
-            State::EmitSell => {
-                let price = self.max_price.min(
-                    tick.book.best_ask().unwrap_or(self.max_price),
-                );
-                let size = self.spread_cfg.order_size;
-                let (maker_amount, taker_amount) =
-                    encode_amounts(Side::Sell, price, size);
-                client
-                    .place_single_order(
-                        tick.token_id,
-                        maker_amount,
-                        taker_amount,
-                        Side::Sell,
-                    )
-                    .await?;
-                State::AwaitBook
+            Decision::CancelPrimary | Decision::CancelSecondary => {
+                // The original issues a CANCEL batch. Replica's
+                // cancel path is delegated (not wired in this
+                // minimal build). Proceed.
+                self.state = State::AwaitBook;
             }
-
-            State::CancelPrimary | State::CancelSecondary => {
-                // The original issues a CANCEL batch here. The
-                // replica's cancel path is delegated to the
-                // caller via a hook (not wired in this minimal
-                // build). Proceeding directly.
-                State::AwaitBook
+            Decision::Skip => {
+                if self.state == State::Backoff {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    self.state = State::AwaitBook;
+                }
             }
-
-            State::Backoff => {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                State::AwaitBook
-            }
-
-            State::Stop => State::Stop,
-        };
+        }
         Ok(self.state)
     }
+}
 
-    fn advance(&mut self, s: State) -> State {
-        self.state = s;
-        s
-    }
+/// What the state machine decided to do this iteration.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Decision {
+    /// Emit an order for `side` at `price` with `size` shares.
+    Emit {
+        side: Side,
+        price: f64,
+        size: f64,
+        maker_amount: U256,
+        taker_amount: U256,
+        surplus: f64,
+    },
+    /// Cancel active orders — pivot said no rebalance needed.
+    CancelPrimary,
+    /// Cancel active orders — gate said spread too tight.
+    CancelSecondary,
+    /// No decision this iteration (init, backoff, etc.).
+    Skip,
 }
 
 /// Convert (price, size) into (makerAmount, takerAmount) in the
