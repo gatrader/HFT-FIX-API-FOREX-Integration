@@ -2571,3 +2571,276 @@ The user's own list, with the honest answer for each:
   picker, market picker, burst/timing formula, Sell-side write
   offset, `target_spread` decay purpose, gabagool22.com server,
   whether the seller runs a stronger private binary.
+
+---
+
+## 31. Deep-dive pass — four parallel re-traces
+
+This pass ran four parallel binary agents covering the Bucket A
+residuals from §30. Three of four delivered strong results; the
+fourth refuted more prior structural assumptions than it answered.
+Net effect: the offset map is now mostly ground-truth, the state
+machine is labelled, `target_spread`'s role is confirmed, and the
+BUY-vs-SELL architecture is **different** from what earlier
+sections assumed.
+
+### 31.1. BotConfig proven offset map
+
+Derived from `BotConfig::merge_with_args` (0x177480) direct stores.
+Total struct size **≥ 0xe8 bytes, padded to 0xf0** (not 0xe0).
+
+| Offset | Type | Field | Proof |
+|--------|------|-------|-------|
+| +0x00..+0x18 | String | *slug (best guess)* | assembly store in deserialize_struct at 0x1614xx |
+| +0x18..+0x30 | String | **symbol** | merge_with_args store at 0x1774f4 |
+| +0x30..+0x48 | ?? 24B | *`name`/`type` or nested `Strategy` sub-struct* | write at 0x1614c4; deserializer has `strategy` + `max_loss` duplicate_field checks |
+| +0x48..+0x60 | Option\<String\> | **current_market** | merge_with_args override at 0x177740 + Option niche sentinel at 0x17771e |
+| +0x60 | f64 | **max_buy_order_size** | merge_with_args 0x177606 |
+| +0x68 | f64 | **spread_threshold** | merge_with_args 0x17761f |
+| +0x70 | i64 | **trade_cooldown** | merge_with_args 0x177638 |
+| +0x78 | f64 | **balance_factor** | merge_with_args 0x17764e |
+| +0x80 | i64 | **stop_before_end_ms** | merge_with_args 0x177691 |
+| +0x88 | f64 | *order_size (guess)* | JSON-only, no CLI override |
+| +0x90 | f64 | **min_price** | merge_with_args 0x1776aa |
+| +0x98 | f64 | **max_price** | merge_with_args 0x1776c6 |
+| +0xa0 | f64 | *max_position_size (guess)* | JSON-only |
+| +0xa8..+0xc0 | String | *trade_side (guess)* | `default_trade_side` returns `"up"` at 0x176fc0; matches 16B read at +0xa8 |
+| +0xc0 | f64 | **target_spread** | store to Arc+0x28 @ 0x97b34 traced to +0xc0 |
+| +0xc8 | f64 | *edge_threshold (guess)* | by elimination |
+| +0xd0 | Option\<f64\> discriminant byte | **spread_reducer_probability (Some byte)** | proves the 0xc1a1f reducer gate. **NOT** enable_gamble. |
+| +0xd8 | f64 | *spread_reducer_probability payload or spread_reducer_value* | pair with +0xd0 |
+| +0xe0 | u32 | **interval_minutes** | merge_with_args 0x1775d6 |
+| +0xe4 | bool | **dry_run** | merge_with_args 0x1775f1 |
+| +0xe5 | bool | **enable_gamble** | **merge_with_args 0x177667** — definitive. |
+| +0xe6 | bool | **log_price** | merge_with_args 0x17767c |
+| +0xe8 | bool | **cancel_orders_on_start** | merge_with_args 0x1775b0 |
+
+**Correction chain**: prior §22e / §23 / §28 claims of
+`enable_gamble @ +0xa0` and `enable_gamble @ +0xd0` are both
+**REFUTED**. enable_gamble is at **+0xe5** — a single CLI-overridable
+bool. The +0xd0 byte driving the reducer gate at 0xc1a1f is the
+Option-Some discriminant of `spread_reducer_probability`, not
+enable_gamble. **What reads +0xe5 at runtime is currently unknown**
+— a direct search for `cmpb $0x0,0xe5(…)` or its mirror has not
+been performed yet.
+
+### 31.2. Three jumptables fully decoded
+
+Each jumptable belongs to a **different** async closure, not to one
+primary+sub layout. Ground-truth:
+
+**JT 0x6cb914 — `run_side_capture` worker closure (0xd9e90).**
+State byte at `rbx+0x259`. 23 entries. Key states:
+
+- 0 → 0xd9ec3: INIT (clears flags rbx+0x25e/0x261)
+- 1, 2: Rust async-trap panics
+- 3 → 0xda9df: **SUSPEND on `RwLock::read(rbx+0x268)` — the market/book read**; post-resume emits BUY/SELL decision logs
+- 4: resume of state 3's lock-read
+- 5 → 0xdc960: SUSPEND on `RwLock::write(rbx+0x270)` — position mutation
+- 6 → 0xdcb1a: SUSPEND on `RwLock::write(rbx+0x268)` — book update
+- 7 → 0xddd45: SUSPEND on `RwLock::read(rbx+0x268)` — post-BUY book re-read
+- **8 → 0xde73a: SUSPEND on `place_single_order` — EMIT BUY** (sets flag rbx+0x25e=1, result at rbx+0x1a8)
+- 9 → 0xdeee0: SUSPEND on `RwLock::write(rbx+0x268)` — post-BUY book write
+- 10 → 0xde132: SUSPEND on `RwLock::read(rbx+0x268)` — post-BUY observation (flag rbx+0x262=1)
+- 11–14, 21: completion trampolines → drop sequences at 0xda360, 0xdf328, 0xe0ccf, 0xdf470, 0xdf593
+- **15 → 0xdf7e3: SUSPEND on `place_single_order` — EMIT SELL** (sets flag rbx+0x25f=1, result at rbx+0x218)
+- 16 → 0xdfc43: SUSPEND on `RwLock::read` post-SELL (flag rbx+0x261=1)
+- 17 → 0xe0797: SUSPEND on `RwLock::write(rbx+0x270)` — finalize position after SELL fill
+- 18 → 0xddf99: mid-flow `RwLock::read` (flag rbx+0x260=1)
+- 19 → 0xe019f: SUSPEND on `TradingClient::cancel_orders(rbx+0x288)` — primary CANCEL
+- 20 → 0xde074: SUSPEND on `RwLock::read(rbx+0x270)` — position read
+- 22 → 0xdd182: SUSPEND on `cancel_orders(rbx+0x280)` — secondary CANCEL
+
+State-merge-and-yield point at `0xe0d92: mov BYTE PTR [rbx+0x259], bpl` — all "store next state" writes flow through here followed by `mov al,0x1` (Poll::Pending).
+
+**JT 0x6cb9a0 — `run_spread_capture_loop` inner closure (0xe3b00).**
+State byte at `rbx+0x40`. 6 entries. States 3–5 are suspend/resume;
+state 0 cascades into 3 nested tiny-JTs at 0x6cb9b8/c8/d8 implementing
+a `SideState` sub-enum.
+
+**JT 0x6cbe38 — `run_spread_capture_loop` outer closure (0x1167e0).**
+State byte at `rbp+0x621`. 13 entries. Only state 3 is a real
+suspend (→ 0x116ce8: `TradingClient::cancel_all_open_orders`, the
+initial cleanup). States 4–12 are resume landing pads feeding a
+sub-state-byte at `rbp+0x6fa` dispatched through tiny-JTs at
+0x6cbe6c onward.
+
+Rust async codegen strips variant names; symbolic state names
+(`WaitingForBuyFill`, `EmittingSell`, etc.) are not in the binary.
+
+### 31.3. `target_spread` is an urgency-decaying entry threshold
+
+Theory **C confirmed**. Three read sites of Arc+0x28 inside
+`run_side_capture`:
+
+1. **0xdcaa4 (decay)** — known:
+   `self[+0x28] = max(0, self[+0x28] − rbx[+0x268])` each tick.
+2. **0xde541 (BEHAVIOURAL GATE)** — newly confirmed:
+   ```
+   mov    0x60(%rbx), %rax         ; Arc payload pointer
+   mov    0x178(%rbx), %rcx        ; secondary config/market struct
+   movsd  0x20(%rcx), %xmm1        ; base_edge_threshold
+   addsd  0x28(%rax), %xmm1        ; threshold := base_edge + target_spread
+   ucomisd %xmm1, %xmm0            ; xmm0 = observed_spread
+   jbe    0xde7d6                  ; if observed ≤ threshold → SKIP
+   ```
+3. **0xdf0ac (LOG gate)** — prints the current `target_spread`
+   value when observed spread hasn't yet exceeded it
+   ("waiting…" log line), via `stdio::_print` at 0xdf212.
+
+**Semantics**: `target_spread` inflates the effective edge
+threshold at cycle start and decays toward zero as ticks elapse.
+Cycle-start: demands big spread; late-cycle: fires on any edge
+≥ base. It is an **urgency/impatience knob**, not a cooldown,
+not a size multiplier, not dead.
+
+This directly contradicts §28c and §24 (which said dead) and
+§30.1 (which said live but unknown role). It also means
+`target_spread` is one of the most important config fields,
+alongside `edge_threshold` and `max_position_size`.
+
+### 31.4. BUY vs SELL architecture is spawn-per-side, not branch
+
+The fourth agent delivered a structural reframing that changes
+§28b and §28h.
+
+- **Prior claim** (§28b): `run_side_capture` is a single closure
+  that runs Side=Buy only.
+- **Revised**: `run_side_capture` at 0xd9e90 runs BOTH buy and
+  sell within its 23-state machine (states 8=BUY, 15=SELL). The
+  "buy-only" claim was wrong; the Sell path IS reached inside
+  the same closure, via states 10→15 after position accumulation.
+- **Unresolved**: the fourth agent also raised the possibility
+  that BUY and SELL are **separately spawned worker futures**
+  (monomorphized copies around 0x1a8570 and 0x1b05a0 via
+  `tokio::task::spawn`). That would mean the 23-state machine is
+  ONE worker's internal loop (probably the SELL worker), and a
+  sibling BUY worker has its own equivalent. This could not be
+  resolved in this pass.
+- **Side byte write for Sell**: NOT located as an immediate.
+  The bytes at rbx+0x2eb/+0x2ec previously thought to be Side
+  are actually an **async state discriminant for a nested future
+  chain** (build/sign/post), dispatched at 0xde7a3 on values
+  3/4/5. The actual Side is likely (a) baked into a capture
+  copied from BotConfig (`trade_side` String at +0xa8), (b)
+  passed as a function argument to `place_single_order`, or
+  (c) implicit in a monomorphization. Candidate sites inside
+  `place_single_order` (0xe1a10): `movb $0x1,0x144(%rbx)` at
+  0xe2180 and `movb $0x1,0x81(%rbx)` at 0xe23f5 — unconfirmed.
+
+**Practical implication**: `is_bearish` at rbx+0x25a still picks
+the TOKEN (YES/NO) as §28e said, not the DIRECTION. The bot
+cycles buy→sell **on the chosen token** within a single
+`run_side_capture` invocation. Two-sided wallet behaviour (fills
+on both YES and NO) still requires dual MarketNodes. The
+dual-MarketNode hypothesis from §29c survives.
+
+### 31.5. PositionState layout corrected
+
+drop_in_place at 0x6cc50 (and alias at 0x1acc60) decodes as:
+
+```
+PositionState (24 bytes, 2-variant enum):
+  +0x00  u64   discriminant (niche: 0x8000... = Idle)
+  +0x08  *ptr  heap box     (only valid for Held variant)
+  +0x10  u64   len/cap
+```
+
+This is NOT a `{up_qty, down_qty}` struct. The `up_qty`/`down_qty`
+fields seen in the "Position updated: UP=, DOWN=" logs belong to
+a **different type**: `arbitrage_bot::trading::position::Position`
+(confirmed via symbol lookup). Those are the aggregated
+cross-market position counters; `PositionState` is the per-node
+current-order-slot enum.
+
+### 31.6. Updated field-liveness table (post-§31 corrections)
+
+| Field | Offset | Runtime effect | Evidence |
+|-------|--------|----------------|----------|
+| symbol | +0x18 | market selection | merge_with_args |
+| slug (inferred) | +0x00 | market selection | deserializer |
+| current_market | +0x48 | market selection | merge_with_args + Option niche |
+| max_buy_order_size | +0x60 | order size | merge_with_args + place_single_order |
+| spread_threshold | +0x68 | ??? | offset proven, consumer not pinned |
+| trade_cooldown | +0x70 | ??? | offset proven, consumer not pinned |
+| balance_factor | +0x78 | banner-only (§2) | prior |
+| stop_before_end_ms | +0x80 | run_user_ws_monitor only; absent from spread_capture | §28d |
+| min_price | +0x90 | ??? | offset proven, consumer not pinned |
+| max_price | +0x98 | ??? | offset proven, consumer not pinned |
+| max_position_size (inferred) | +0xa0 | buy→sell pivot | strings + structural inference |
+| trade_side (inferred) | +0xa8 | token-slot selector | §28e + default_trade_side |
+| target_spread | +0xc0 | **urgency-decay threshold** — §31.3 | 0xde541 confirmed |
+| edge_threshold (inferred) | +0xc8 | base edge gate | inferred from 0xde53c load via rbx+0x178+0x20 |
+| spread_reducer_probability.Some byte | +0xd0 | run_trading_loop reducer gate | 0xc1a1f confirmed |
+| spread_reducer_probability.value OR spread_reducer_value | +0xd8 | reducer payload | paired with +0xd0 |
+| interval_minutes | +0xe0 | outer loop bound | merge_with_args |
+| dry_run | +0xe4 | banner (real gate = size==5.0 at 0xe1a8e) | merge_with_args + §15 |
+| **enable_gamble** | +0xe5 | **UNKNOWN runtime reader** | merge_with_args sets it; consumer not located |
+| log_price | +0xe6 | log verbosity | merge_with_args |
+| cancel_orders_on_start | +0xe8 | run_trading_loop+0x719 cancel gate | merge_with_args + prior §11c |
+
+### 31.7. What changed since §30
+
+- **§28a / §30.2**: "enable_gamble controls ONLY the reducer at
+  0xc1a1f" — **weakened to unproven**. That gate reads
+  `spread_reducer_probability`. enable_gamble's runtime reader
+  is not yet located. It might still only affect the reducer
+  path (via a different gate), but the direct evidence chain is
+  broken. Re-verify needed.
+- **§28c / §30.1**: target_spread **decay is live AND the decayed
+  value is consumed** as an additive term on the edge threshold.
+  It is the most important spread_capture knob after
+  edge_threshold itself.
+- **§28b / §30.1**: `run_side_capture` contains BOTH BUY and
+  SELL code paths, but the 23-state state machine handles them
+  within a single closure — not via a state flag flipping
+  inside a buy-only loop. The "buy-then-sell exit" interpretation
+  is correct; the "buy-only" interpretation was wrong.
+- **§30 audit table Confidence column**: the spread_capture loop
+  state flow has moved from ~55% to **~75%**: we have all state
+  indices, their suspend points, and their transition edges.
+  What we lack is the operator-friendly labelling (which states
+  correspond to "idle", "quoting", "filled", etc.) and the
+  max_position_size check that triggers the buy→sell pivot.
+- **New unknowns raised**: (a) what reads enable_gamble at
+  runtime; (b) where the Side=Sell byte is set; (c) whether
+  there are separately-spawned BUY and SELL worker futures
+  (0x1a8570 / 0x1b05a0) vs a single closure running both.
+
+### 31.8. Clone-recipe delta
+
+Adding to §29j:
+
+- **DO NOT copy the reducer-gate logic verbatim.** It's gated on
+  `spread_reducer_probability.is_some()`, not `enable_gamble`.
+  Leaving that field unset in config effectively disables the
+  reducer path without needing to patch the binary.
+- **Replicate `target_spread` decay semantics.** This is the
+  subtle impatience mechanism that makes the bot fire
+  progressively later in a cycle. An implementation that hardcodes
+  a flat edge threshold will behave very differently.
+- **Initialise `target_spread` config-tunable.** Starting value
+  controls how aggressive the bot is at cycle start; set it too
+  high and the bot waits forever; set it to zero and you lose
+  the urgency mechanic.
+- **For dual-MarketNode orchestration**: given that
+  `run_side_capture` handles both buy and sell internally, two
+  nodes each running one token slot really do produce two-sided
+  wallet behaviour without any extra coordination. Dual
+  MarketNodes + independent `run_side_capture` per node is the
+  complete picture.
+
+### 31.9. Residual gaps after §31
+
+| Gap | Difficulty | Evidence needed |
+|-----|------------|-----------------|
+| enable_gamble runtime reader | easy | grep `cmpb …,0xe5(…)` and its mirror offsets |
+| Side=Sell byte location | medium | trace `place_single_order` monomorphisations |
+| Whether two spawned workers or one closure | medium | decode 0x1a8570 / 0x1b05a0 tokio::spawn wrappers |
+| max_position_size buy→sell pivot instruction | easy–medium | grep `ucomisd …,0xa0(…)` sites inside run_side_capture |
+| slug / name / type / order_size / max_position_size / trade_side / edge_threshold proven offsets | medium | exhaust the 11 remaining default-setter functions around 0x176fc0–0x177480 |
+| spread_threshold / trade_cooldown / min_price / max_price runtime consumers | medium | grep reads of +0x68/+0x70/+0x90/+0x98 |
+| Radar client-side scoring logic | hard (and Bucket B-adjacent) | dashboard React bundle deminify |
+
+Three of these are easy follow-ups (≤1 hour of agent time each).
+The rest require either more disassembly passes or external data.
