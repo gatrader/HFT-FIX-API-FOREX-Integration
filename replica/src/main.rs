@@ -133,12 +133,24 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // JSON output is opt-in via RUNTIME_LOG_JSON=1 so interactive
+    // runs keep the ANSI fmt. The EC2 benchmark recipe sets it to
+    // get structured JSONL lines for the post-processing parser.
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    if std::env::var("RUNTIME_LOG_JSON").ok().as_deref() == Some("1") {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .init();
+    }
 
     let cli = Cli::parse();
     if let Some(parent) = cli.nonce.parent() {
@@ -217,6 +229,10 @@ async fn main() -> Result<()> {
             let stats = Arc::new(RuntimeStats::default());
 
             let mut rt: Runtime;
+            // Hoisted so the 1 Hz stats logger below can read
+            // ws_fallback_to_rest_count into the runtime_tick event.
+            #[cfg(feature = "ws")]
+            let mut ws_stats_for_log: Option<Arc<arbigab_replica::ws::WsStats>> = None;
             #[cfg(feature = "ws")]
             {
                 use arbigab_replica::ws::{WsClient, WsStats};
@@ -229,6 +245,7 @@ async fn main() -> Result<()> {
                         ws_stats.clone(),
                     );
                     tokio::spawn(async move { let _ = ws_client.run().await; });
+                    ws_stats_for_log = Some(ws_stats.clone());
                     rt = base.with_ws_stats(ws_stats);
                 } else {
                     rt = base;
@@ -271,10 +288,19 @@ async fn main() -> Result<()> {
             // decision tick so the log isn't N×/sec at 150ms ticks.
             let stats_for_log = stats.clone();
             let book_for_log = book.clone();
+            #[cfg(feature = "ws")]
+            let ws_stats_for_logger = ws_stats_for_log.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     let b = book_for_log.read();
+                    #[cfg(feature = "ws")]
+                    let ws_fallbacks: u64 = ws_stats_for_logger
+                        .as_ref()
+                        .map(|s| s.ws_fallback_to_rest_count())
+                        .unwrap_or(0);
+                    #[cfg(not(feature = "ws"))]
+                    let ws_fallbacks: u64 = 0;
                     tracing::info!(
                         target: "runtime_tick",
                         ticks = stats_for_log.tick_count(),
@@ -287,6 +313,7 @@ async fn main() -> Result<()> {
                         queue_full_drops = stats_for_log.queue_full_drops(),
                         last_queue_wait_us = stats_for_log.last_queue_wait_us(),
                         last_http_submit_us = stats_for_log.last_http_submit_us(),
+                        ws_fallback_to_rest_count = ws_fallbacks,
                         book_age_ms = ?b.book_age_ms(),
                         best_bid = ?b.best_bid(),
                         best_ask = ?b.best_ask(),
