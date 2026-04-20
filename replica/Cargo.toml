@@ -25,6 +25,11 @@ alloy-signer         = "0.6"
 alloy-signer-local   = "0.6"
 alloy-dyn-abi        = { version = "0.8", features = ["eip712"] }
 
+hmac                 = "0.12"
+sha2                 = "0.10"
+base64               = "0.22"
+chrono               = "0.4"
+
 [dev-dependencies]
 tempfile = "3"
 

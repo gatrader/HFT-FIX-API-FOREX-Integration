@@ -7,6 +7,7 @@
 //! fields, or any guardrails absent from the artifact. See §11
 //! of the spec for what is deliberately omitted.
 
+pub mod auth;
 pub mod book;
 pub mod client;
 pub mod config;

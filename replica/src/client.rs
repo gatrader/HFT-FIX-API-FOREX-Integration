@@ -15,6 +15,7 @@ use rand::RngCore;
 use reqwest::{Client as HttpClient, Url};
 use serde::Serialize;
 
+use crate::auth::{bootstrap_credentials, l2_headers, ApiCredentials};
 use crate::book::BookSnapshot;
 use crate::nonce_store::NonceStore;
 use crate::order::{ClobOrder, Side};
@@ -52,6 +53,7 @@ pub struct SignedOrder {
 
 pub struct TradingClient {
     signer: Eip712Signer,
+    raw_signer: alloy_signer_local::PrivateKeySigner,
     maker: Address,
     nonce: Arc<AtomicU64>,
     nonce_store: NonceStore,
@@ -59,6 +61,7 @@ pub struct TradingClient {
     book_cache: Arc<RwLock<BookSnapshot>>,
     dry_run: bool,
     fee_rate_bps: u32,
+    creds: RwLock<Option<ApiCredentials>>,
 }
 
 impl TradingClient {
@@ -69,6 +72,8 @@ impl TradingClient {
         fee_rate_bps: u32,
     ) -> anyhow::Result<Self> {
         let signer = Eip712Signer::from_hex(hex_key)?;
+        let raw_signer: alloy_signer_local::PrivateKeySigner =
+            hex_key.parse()?;
         let maker = signer.maker();
         let nonce_store = NonceStore::open(nonce_path)?;
         let nonce = Arc::new(AtomicU64::new(nonce_store.load()));
@@ -77,6 +82,7 @@ impl TradingClient {
             .build()?;
         Ok(Self {
             signer,
+            raw_signer,
             maker,
             nonce,
             nonce_store,
@@ -84,7 +90,29 @@ impl TradingClient {
             book_cache: Arc::new(RwLock::new(BookSnapshot::default())),
             dry_run,
             fee_rate_bps,
+            creds: RwLock::new(None),
         })
+    }
+
+    /// Seed credentials directly (if you already have them from a
+    /// previous bootstrap saved on disk).
+    pub fn set_credentials(&self, creds: ApiCredentials) {
+        *self.creds.write() = Some(creds);
+    }
+
+    /// L1 bootstrap — one-time. Hits /auth/api-key, stores the
+    /// resulting credentials in memory. Returns them so the caller
+    /// can also persist them to disk if desired.
+    pub async fn bootstrap(&self) -> Result<ApiCredentials, ClientError> {
+        let c = bootstrap_credentials(&self.http, &self.raw_signer)
+            .await
+            .map_err(|e| ClientError::Other(e.to_string()))?;
+        *self.creds.write() = Some(c.clone());
+        Ok(c)
+    }
+
+    fn now_ts() -> i64 {
+        chrono::Utc::now().timestamp()
     }
 
     pub fn maker(&self) -> Address {
@@ -155,18 +183,43 @@ impl TradingClient {
             .map_err(|e| ClientError::Sign(e.to_string()))?;
         let signed = SignedOrder { order, signature: sig };
 
+        let body = serde_json::to_string(&signed)
+            .map_err(|e| ClientError::Other(e.to_string()))?;
+
         if self.dry_run {
-            tracing::info!(
-                target: "dry_run",
-                "{}",
-                serde_json::to_string(&signed)
-                    .unwrap_or_else(|_| "<ser fail>".into())
-            );
+            tracing::info!(target: "dry_run", "{body}");
             return Ok(());
         }
 
-        let url = Url::parse(&format!("{CLOB_BASE}/data/orders"))?;
-        let resp = self.http.post(url).json(&signed).send().await?;
+        let path = "/data/orders";
+        let url = Url::parse(&format!("{CLOB_BASE}{path}"))?;
+        let creds = self
+            .creds
+            .read()
+            .clone()
+            .ok_or_else(|| ClientError::Other(
+                "no API credentials — call bootstrap() or set_credentials() first"
+                    .into(),
+            ))?;
+        let headers = l2_headers(
+            self.maker,
+            &creds,
+            Self::now_ts(),
+            "POST",
+            path,
+            &body,
+        )
+        .map_err(|e| ClientError::Other(e.to_string()))?;
+
+        let mut req = self
+            .http
+            .post(url)
+            .header("Content-Type", "application/json")
+            .body(body);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await?;
         resp.error_for_status()?;
         Ok(())
     }
