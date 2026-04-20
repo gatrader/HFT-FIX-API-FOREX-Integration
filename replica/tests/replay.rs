@@ -25,7 +25,7 @@ fn book(bid: f64, ask: f64) -> BookSnapshot {
     BookSnapshot {
         bids: vec![BookLevel { price: bid, size: 1000.0 }],
         asks: vec![BookLevel { price: ask, size: 1000.0 }],
-        last_updated_at: None,
+        ..BookSnapshot::default()
     }
 }
 

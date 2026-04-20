@@ -288,7 +288,7 @@ impl WsClient {
         let mut snap = BookSnapshot {
             bids: b.bids.into_iter().filter_map(level_into).collect(),
             asks: b.asks.into_iter().filter_map(level_into).collect(),
-            last_updated_at: None,
+            ..BookSnapshot::default()
         };
         snap.stamp_now();
         *self.book_cache.write() = snap;
