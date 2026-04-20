@@ -188,7 +188,7 @@ impl TradingClient {
 
     pub async fn fetch_book(&self, token_id: &str) -> Result<(), ClientError> {
         let url = Url::parse(&format!("{CLOB_BASE}/book"))?;
-        let snap: BookSnapshot = self
+        let mut snap: BookSnapshot = self
             .http
             .get(url)
             .query(&[("token_id", token_id)])
@@ -197,6 +197,9 @@ impl TradingClient {
             .error_for_status()?
             .json()
             .await?;
+        // Stamp before committing to cache so any reader observes
+        // a consistent (contents, age) pair under the RwLock.
+        snap.stamp_now();
         *self.book_cache.write() = snap;
         Ok(())
     }
