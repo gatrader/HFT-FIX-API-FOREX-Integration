@@ -2312,4 +2312,262 @@ Combine §22 + §28 + §29 → the honest clone is:
 6. **Keep** the credential-exfil removed (§27) — no negotiation.
 
 This is now a **concrete, one-page spec** that reproduces the
-observed `not stingo` profile in a defensible way. gate |
+observed `not stingo` profile in a defensible way.
+
+> **NOTE (added in §30):** part of the §22 / §29 recipe rests on
+> claims about §28 that have since been REFUTED by direct
+> disassembly. The clone recipe still stands but the justification
+> in §28b and §28c should be read through §30.
+
+---
+
+## 30. Final audit — re-verification against the binary
+
+A forensic re-verification pass was performed directly against
+`bot/bin/arbitrage_bot` (ELF x86-64, not stripped, BuildID
+`0e348a5a1196…f0dbb`, 10,118,560 bytes). Two prior agent claims
+survived; four were refuted; several were corrected. This section
+is the ground-truth audit. Prior sections are left intact for
+traceability but any conflict is resolved here.
+
+### 30.1. Refuted prior claims
+
+**§28b — "spread_capture is BUY-ONLY" — REFUTED.**
+The SELL code path is live inside `spread_capture_ws::run_side_capture`
+(0xd9e90). Format strings present and reachable via a pieces-table
+at `0x869690` loaded at `0xde2de: lea 0x5fc22b(%rip),%rax`:
+- "Posting SELL @ $"
+- "SELL FILLED @ $ | PnL: $"
+- "SELL order error:"
+- "SELL not placed, resetting"
+- "SELL fill detected:"
+- "At max position, waiting for SELL fill"
+
+The real loop structure is **buy-accumulate-until-max-position,
+then-sell-to-exit**, not a pure accumulator. Side=Buy still
+hardcoded at `0xdf7da` (`movw $0x100,0x2eb(%rbx)`) — the Sell-path
+writes must occur at a separate pinned address not located in
+this pass. `max_position_size` is the pivot between the two
+phases. At wallet level this produces alternating Buy/Sell fills
+**on the same token** — not two-sided in the YES-vs-NO sense.
+
+**§28c — "target_spread at self+0x28 is a dead capture" — REFUTED.**
+There is a live decay at `0xdcaa4–0xdcabb` inside `run_side_capture`:
+
+    movsd  0x28(%r12), %xmm0      ; load current target_spread
+    subsd  0x268(%rbx), %xmm0     ; subtract observed spread
+    xorpd  %xmm1, %xmm1           ; zero
+    maxsd  %xmm1, %xmm0           ; floor at 0
+    movsd  %xmm0, 0x28(%r12)      ; writeback
+
+This is an EMA-like countdown: `target_spread[t+1] =
+max(0, target_spread[t] − observed_spread[t])`. Purpose unclear
+(throttle? warm-up gate? urgency timer?) but the slot is
+definitely read and mutated every tick, not dead.
+
+**§23 / §24 / §28a — "enable_gamble is at BotConfig+0xa0, target_spread is at BotConfig+0xb0" — REFUTED.**
+Direct enumeration of every BotConfig dereference in
+`run_single_market` (0x89670..0x8c69d) shows:
+
+- `run_trading_loop` construction (0x8bb84) reads BotConfig
+  at: +0x68, +0x70, +0x80, +0xe4, +0xe6, +0xe8, +0x90..+0x9f
+  (16B), +0xd0..+0xdf (16B). **Neither +0xa0 nor +0xb0 is read.**
+- `spread_capture` construction (0x8bd0f) reads: +0x80,
+  +0xa8..+0xb7 (16B), +0xb8, +0xc0, +0xe6 (twice), +0xe8.
+  +0xa0 still not read; +0xb0 is only inside a 16-byte movups
+  along with +0xa8 (likely a `&str` pointer+length pair, not two
+  f64s).
+- The bool gated at `0xc1a1f: cmpb $0x0,0x150(%rcx); je …` is
+  traced back through `0x8bc5a: movups %xmm3,0x168(%rbx)` to
+  BotConfig+**0xd0**'s first byte, not +0xa0.
+- The f64 stored at `0x97b34: movsd %xmm0,0x28(%rax)` is traced
+  through closure+0x78 ↔ outer+0x140 ↔ 0x8bd1d to BotConfig+**0xc0**,
+  not +0xb0.
+
+So the mirror/gate mechanics are real, but the BotConfig
+field-to-offset mapping in §23 / §24 was guessed incorrectly.
+`serde` confirms both `"enable_gamble"` and `"target_spread"` are
+valid JSON keys (XOR matchers at 0x15f119 and 0x15f144 in the
+deserialiser at 0x15ea80), but which struct offset each lands at
+requires full serde sentinel-slot tracing that was not completed.
+
+**Jumptable address correction (§28g):** the three jumptables
+are at `0x6cb914`, `0x6cb9a0`, `0x6cbe38` — not `0x7cb*`. Typo
+in prior notes.
+
+### 30.2. Confirmed prior claims
+
+- **Side=Buy hardcoded** at `0xdf7da: movw $0x100,0x2eb(%rbx)` and
+  also at `0xde731`. No matching `movw $0x1,0x2eb(…)` anywhere in
+  `.text` — Side is never written as Sell through this offset.
+  (The Sell branch must set Side differently — possibly through
+  a different closure state offset. Not located.)
+- **`is_bearish` token-slot selector at rbx+0x25a**. Byte copied
+  from rbx+0x258 to rbx+0x25a at `0xd9ed7–0xd9ede`. Used at
+  `0xe04a9` (shift-by-5 index into a 32-byte-stride token table)
+  and `0xe071a`. Offset `0xdefef` from prior notes does NOT match
+  a token-selector instruction — that pin was wrong.
+- **Dutch-book reducer gate reads state+0x150** (BotConfig+0xd0
+  first byte, post-mirror) at `0xc1a1f`. Present only in
+  `run_trading_loop` path, absent from `run_spread_capture_loop`.
+  So "enable_gamble is dutch_book-only" stands **as behaviour**;
+  only the offset identity was wrong.
+- **Four-channel C2 to gabagool22.com** (§27) stands — verified
+  in this pass via binary strings: `https://clob.polymarket.com`,
+  `https://gabagool22.com/api/verify-balancing-conf` are the only
+  HTTPS endpoints in the binary.
+- **Merge/redeem is not in this repo** (§29g was too generous).
+  Zero hits for `mergePositions`, `redeemPositions`, `NegRiskAdapter`,
+  CTF / NegRisk contract addresses, `eth_send*`, or any Polygon
+  JSON-RPC surface. Binary only signs CLOB EIP-712 orders/auth.
+  Dashboard has 35 API routes; none touch on-chain positions.
+  The systematic merge/redeem observed on reference wallets must
+  come from an out-of-band operator process — **not** from the
+  purchased bot.
+
+### 30.3. New findings not in prior sections
+
+- **`PositionState` struct exists** (drop_in_place symbols at
+  `0x6cc50`, `0x1acc60`). Position is tracked with Up/Down slots —
+  strings "Position updated: UP=, DOWN=" and "Position updated
+  (sell): UP=, DOWN=" both present.
+- **Edge-threshold log path pinned**. Strings "Ask $ too thin
+  (edge <" and "Spread $ below edge threshold $, waiting…"
+  referenced near `0x80d72 / 0x81015 / 0x81190`. These are the
+  log-lines the edge gate emits when refusing a buy.
+- **Closure layout.** `run_spread_capture_loop` (0x97950) is a
+  thin state-machine shell; the per-tick logic lives in
+  `run_side_capture` closure at `0xd9e90`.
+- **Exhaustive BotConfig CLI/field list** from strings:
+  `symbol, interval_minutes, dry_run, max_buy_order_size,
+  spread_threshold, trade_cooldown, balance_factor,
+  stop_before_end_ms, min_price, max_price, enable_gamble,
+  target_spread, order_size, max_position_size, trade_side,
+  inventory_skew, edge_threshold, refresh_interval_ms,
+  spread_reducer_probability, spread_reducer_value`. All parsed;
+  offset mapping mostly unpinned.
+- **BotConfig total size = 0xe0 (224 bytes)** — confirmed at
+  `0x1770e6: mov $0xe0, %edx` in `BotConfig::load_from_file`
+  (0x177010).
+
+### 30.4. Audit table — Recovered / Inferred / Rebuilt / Unknown
+
+| Item | Class | Source / evidence |
+|------|-------|-------------------|
+| Credential exfil to gabagool22.com | **Recovered (A)** | Binary strings + `TradingClient::new` decomp |
+| `/api/configurations/refresh-official` remote overwrite | **Recovered (A)** | route.js read in full |
+| `instrumentation.js` seed-on-empty | **Recovered (A)** | Fully decoded |
+| `BotConfiguration` schema | **Recovered (A)** | Prisma schema + route.js |
+| 28-state `run_trading_loop` jumptable location | **Recovered (A)** | 0x6cbb28 (prior agents) |
+| `cancel_orders_on_start` gate at +0x719 | **Recovered (A)** | Prior agents |
+| `dry_run` real gate (size=5.0 at 0xe1a8e) | **Recovered (A)** | Prior agents |
+| `run_spread_capture_loop` existence + state machine shell | **Recovered (A)** | 0x97950 confirmed this pass |
+| Side=Buy hardcoded at 0xdf7da / 0xde731 | **Recovered (A)** | Instruction bytes verified |
+| `is_bearish` token-slot semantics (rbx+0x25a) | **Recovered (A)** | 0xd9ede / 0xe04a9 / 0xe071a verified |
+| Reducer gate at 0xc1a1f reads state+0x150 | **Recovered (A)** | Instruction bytes verified |
+| Mirror LEAs 0x9f04e / 0x9f057 copy BotConfig+0xd0 (16B) | **Recovered (A)** | Bytes verified |
+| `target_spread` decay at 0xdcaa4–0xdcabb | **Recovered (A)** | Verified this pass |
+| SELL code live inside `run_side_capture` | **Recovered (A)** | String table at 0x869690 loaded at 0xde2de |
+| Edge-threshold log path | **Recovered (A)** | Strings + cross-refs |
+| BotConfig size = 0xe0 bytes | **Recovered (A)** | load_from_file memcpy |
+| Merge/redeem absent from repo | **Recovered (A)** | Exhaustive grep this pass |
+| JSON schema: enable_gamble + target_spread exist | **Recovered (A)** | serde XOR matchers at 0x15f119 / 0x15f144 |
+| `enable_gamble` controls ONLY run_trading_loop reducer (as behaviour) | **Inferred (B)** | Mirror reaches only that gate; offset identity unproven |
+| `target_spread` identity = f64 at BotConfig+0xc0 | **Inferred (B)** | Stored to self+0x28 which is then decayed; matches "target_spread" name but not proved |
+| `enable_gamble` identity = bool at BotConfig+0xd0 byte 0 | **Inferred (B)** | Gate reads this byte; field name match unproven |
+| `trade_side` as a String with no runtime flipper | **Inferred (B)** | XOR matcher exists; no auto-writer located |
+| Manual (not automatic) side selection | **Inferred (B)** | Absence of evidence for a picker; not a full survey |
+| spread_capture cycle = buy-to-max, sell-to-exit | **Inferred (B)** | "At max position, waiting for SELL fill" string implies the state machine; flow not fully traced |
+| Dual-MarketNode hypothesis (§29c) | **Rebuilt (C)** | Not in binary; explanatory overlay for wallet data |
+| `edge_threshold` gate → lock_sum <1 at wallet | **Rebuilt (C)** | Logical inference; no cross-leg code |
+| No rebalancer in binary | **Rebuilt (C)** | Absence argument; not exhaustively disproved |
+| §22 / §29j clone recipe | **Rebuilt (C)** | Design, not recovered code |
+| "Stingo runs dirty path" (§29h) | **Rebuilt (C)** | Conjecture from wallet divergence |
+| Operator side-picking heuristic | **Unknown (D)** | Requires dashboard radar + operator behavioural data |
+| Candidate-market selection logic | **Unknown (D)** | Radar UI bundle not decoded |
+| Burst-sizing / repeat-timing formula | **Unknown (D)** | Inner loop tail not traced |
+| String-field offsets in BotConfig (slug, symbol, trade_side, etc.) | **Unknown (D)** | Serde sentinel-slot tracing incomplete |
+| Sell-side Side byte write location | **Unknown (D)** | Not pinned; different offset than 0x2eb suspected |
+| Exact meaning of `target_spread` decay | **Unknown (D)** | Mechanic observed; purpose not clear |
+| Whether seller runs a different binary than the one sold | **Unknown (D)** | Would require server-side / binary fingerprint evidence |
+| gabagool22.com server-side logic | **Unknown (D)** | External; only client-visible channels decoded |
+| `inventory_skew` / `balance_factor` runtime effect | **Unknown (D)** | Parsed by serde; reads not located in hot paths |
+| `refresh_interval_ms` / `trade_cooldown` / `min_price` / `max_price` runtime effect | **Unknown (D)** | Same — parsed, reads not pinned |
+
+### 30.5. What would be needed to call the seller edge fully reversed
+
+The user's own list, with the honest answer for each:
+
+1. **Side-picking heuristic.** Not in binary. Stored as a static
+   String on `BotConfiguration`. Either chosen manually by the
+   operator in the dashboard or pushed via
+   `/api/configurations/refresh-official` from gabagool22.com.
+   Resolving this requires **server-side gabagool22.com data**
+   or **operator behavioural observation** — neither is
+   available from the artifact.
+
+2. **Candidate-picking heuristic.** Not in binary either.
+   Dashboard radar UI exists (`/api/polymarket/market-radar`)
+   but its scoring function was not decoded. Resolving requires
+   decompilation of the client-side React bundle plus captured
+   network traffic to see which markets the operator actually
+   receives / selects.
+
+3. **Server-side evidence from gabagool22.com.** Out of reach
+   from the purchased artifact. The four client-visible channels
+   (`/api/official-configs`, credential ingest, telemetry push,
+   seed pull) are decoded, but the server-side ranking /
+   filtering / decision logic is on their infrastructure.
+
+4. **Proof there isn't a stronger private build.** Irreducible
+   without access to the seller's own deployment. The strongest
+   indirect evidence would be: on-chain fingerprinting of the
+   `stingo` wallet against the `not stingo` wallet (different
+   fill cadence, different sizing, different burst shape) —
+   which the TG analysis partially does. A stronger private
+   build is **consistent with all observed evidence** but cannot
+   be proven from the binary alone.
+
+### 30.6. Bottom-line delta since §29
+
+- The hidden strategy is **less clean than §28 claimed** —
+  the Sell path is live. It is still simpler than dutch_book
+  (no reducer, no randomiser, no gamble branch), but the §28h
+  "materially cleaner" verdict was overstated.
+- `target_spread` is **not dead** — it's used in a decay I
+  don't fully understand.
+- BotConfig offsets for the two high-value fields
+  (`enable_gamble`, `target_spread`) are **not pinned**, only
+  their mirror/store locations. All `+0xa0` / `+0xb0` claims in
+  §22e / §23 / §24 / §28 should be treated as **refuted until
+  re-derived** from the serde XOR sentinel trace.
+- **Merge/redeem is external.** The purchased bot never calls
+  the CTF — the on-chain realisation step must be operator-run
+  off-device. This is new, strong, and changes the attack
+  surface: a clone only replicates the trading behaviour, not
+  the full monetisation loop.
+- Dual-MarketNode hypothesis (§29c) is still the most plausible
+  explanation for wallet two-sidedness at the YES-vs-NO level,
+  but it is **rebuilt, not recovered**. The new SELL-path
+  finding does NOT eliminate it: per-node Sell fills are on the
+  same token the node bought, so wallet "Up vs Down" two-
+  sidedness still requires two nodes.
+
+### 30.7. Four-way split, restated crisply
+
+- **Recovered (what is proved):** exfil path, C2 channels, DB
+  schema, strategy bifurcation, mirror-and-gate mechanics,
+  SELL code presence in `run_side_capture`, target_spread decay,
+  merge/redeem absence from the repo.
+- **Inferred (what is likely but not proved):** which BotConfig
+  offset holds which named field; that `enable_gamble` and
+  `target_spread` are the two specific configs whose mirrors
+  we've pinned; the buy-to-max-then-sell-to-exit cycle shape;
+  manual side selection as default.
+- **Rebuilt (what we designed, not recovered):** the dual-node
+  wallet reconciliation; the clean-clone recipe; the stingo-
+  ran-dirty-path conjecture; the no-rebalancer conclusion.
+- **Unknown (what we cannot touch without new data):** side
+  picker, market picker, burst/timing formula, Sell-side write
+  offset, `target_spread` decay purpose, gabagool22.com server,
+  whether the seller runs a stronger private binary.
