@@ -67,12 +67,16 @@ pub struct TradingClient {
     signer: Eip712Signer,
     raw_signer: alloy_signer_local::PrivateKeySigner,
     maker: Address,
-    /// In-memory request counter kept for audit / future cancel-all
-    /// semantics. Deliberately NOT fsynced per submit — that flush
-    /// was measured to cost 1–5ms median / 10–50ms p99 on EBS gp3
-    /// and was in the critical path of every place_single_order.
-    /// The EIP-712 order.nonce is pinned to 0 (CTF Exchange cancel
-    /// nonce), so losing this counter on crash has no wire effect.
+    /// TRACING-ONLY request counter. NOT a trading nonce and NOT
+    /// sent on the wire. The EIP-712 `order.nonce` field is pinned
+    /// to 0 (CTF Exchange cancel nonce); this counter exists solely
+    /// to correlate log lines across the sign/submit/response spans
+    /// and for future local bookkeeping (e.g. cancel-all semantics).
+    ///
+    /// Deliberately NOT fsynced per submit — that flush was measured
+    /// to cost 1–5ms median / 10–50ms p99 on EBS gp3 and sat in the
+    /// critical path of every place_single_order. Losing this counter
+    /// on crash has no protocol-visible effect.
     nonce: Arc<AtomicU64>,
     /// Retained for bootstrap-time load (historical watermark) and
     /// eventual background flush; not written on the hot path.
@@ -166,9 +170,11 @@ impl TradingClient {
         self.book_cache.clone()
     }
 
-    /// In-memory monotonic request counter (hot-path safe, no I/O).
-    /// The on-disk NonceStore is no longer written per submit — see
-    /// the struct doc on `nonce` for why.
+    /// Monotonic counter for correlating log spans within a single
+    /// submit (sign → send → response). TRACING-ONLY: this value is
+    /// NEVER written to the EIP-712 order or any wire payload. The
+    /// on-disk NonceStore is no longer written per submit — see the
+    /// struct doc on `nonce` for why.
     fn next_request_id(&self) -> u64 {
         self.nonce.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -279,6 +285,11 @@ impl TradingClient {
         let submit_ms = t_submit.elapsed().as_millis() as u64;
         let status = resp.status();
 
+        // Phase-1 instrumentation: body drain is still INLINE (the
+        // function does not return until the full response body is
+        // read). Decoupling (return-after-headers + detached drain)
+        // is a deliberate phase-2 change on the architecture-shift
+        // branch, not here.
         let t_body = Instant::now();
         let body_text = resp.text().await.unwrap_or_default();
         let body_ms = t_body.elapsed().as_millis() as u64;
