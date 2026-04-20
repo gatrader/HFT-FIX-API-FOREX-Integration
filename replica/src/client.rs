@@ -176,6 +176,11 @@ impl TradingClient {
         taker_amount: U256,
         side: Side,
     ) -> Result<(), ClientError> {
+        // Record a monotonic request-tracking nonce for our own
+        // audit trail, but the EIP-712 order.nonce field is the
+        // on-chain CTF Exchange cancel nonce — always 0 for a
+        // regular order (Polymarket convention).
+        let _req_nonce = self.next_nonce()?;
         let order = ClobOrder::new(
             Self::fresh_salt(),
             self.maker,
@@ -183,7 +188,7 @@ impl TradingClient {
             maker_amount,
             taker_amount,
             self.expiration(),
-            U256::from(self.next_nonce()?),
+            U256::ZERO,
             U256::from(self.fee_rate_bps),
             side,
         );
