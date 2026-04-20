@@ -3241,9 +3241,10 @@ market replays: **~85%**. Gaps are the decorative fields and
 the exfil HMAC key schedule — neither alters trading behavior.
 
 Confidence that this replica recovers the **seller's edge**:
-**still 0%**. The edge — if any — is in parameter choice
-(`max_position_size`, `order_size`, `edge_threshold`, cooldowns)
-and market selection, neither of which lives in the binary. The
+**not recoverable from the sold artifact alone.** The edge —
+if any — is in parameter choice (`max_position_size`,
+`order_size`, `edge_threshold`, cooldowns) and market
+selection, neither of which lives in the binary. The
 artifact is a generic market-maker quoter with urgency-decaying
 entry. Anyone can run it; nobody gets paid for running it
 without the meta-strategy that was never sold.

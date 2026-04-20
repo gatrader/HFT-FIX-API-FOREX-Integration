@@ -236,9 +236,10 @@ quoter), and is **explicitly out of scope** for this document.
 - Confidence that replica matches observed behavior on market
   replays: **~85%**. The 15% gap is decorative fields and the
   exfil HMAC schedule, neither of which alters trading.
-- Confidence that replica recovers the **seller's edge**: **0%**.
-  The edge, if any, lives in parameter values and market
-  selection — neither was sold with the artifact.
+- Confidence that replica recovers the **seller's edge**:
+  **not recoverable from the sold artifact alone.** The edge,
+  if any, lives in parameter values and market selection —
+  neither was sold with the artifact.
 - Classification: **Rebuilt**.
 
 ---
@@ -264,7 +265,7 @@ quoter), and is **explicitly out of scope** for this document.
 | Anti-analysis                 | Recovered (none)      |
 | Multi-strategy surface        | Recovered      |
 | Dashboard client              | Unknown        |
-| Seller's edge                 | Unrecoverable  |
+| Seller's edge                 | Not in the sold artifact |
 
 One-line verdict: **the artifact is substantially reversed; the
 seller's edge was never in the artifact to begin with.**
