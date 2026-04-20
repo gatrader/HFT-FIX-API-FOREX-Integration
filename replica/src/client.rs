@@ -191,7 +191,7 @@ impl TradingClient {
             return Ok(());
         }
 
-        let path = "/data/orders";
+        let path = "/order";
         let url = Url::parse(&format!("{CLOB_BASE}{path}"))?;
         let creds = self
             .creds
