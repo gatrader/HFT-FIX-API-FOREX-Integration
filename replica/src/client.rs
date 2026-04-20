@@ -82,6 +82,9 @@ pub struct TradingClient {
     /// eventual background flush; not written on the hot path.
     _nonce_store: NonceStore,
     http: HttpClient,
+    /// Base URL for CLOB endpoints. Defaults to `CLOB_BASE`; override
+    /// via `with_base_url` for localhost benchmarks / tests.
+    base_url: Url,
     /// Pre-parsed POST /order URL. Saved ~1–2µs per submit and
     /// eliminates an allocation on the hot path.
     order_url: Url,
@@ -99,6 +102,19 @@ impl TradingClient {
         nonce_path: PathBuf,
         dry_run: bool,
         fee_rate_bps: u32,
+    ) -> anyhow::Result<Self> {
+        Self::with_base_url(hex_key, nonce_path, dry_run, fee_rate_bps, CLOB_BASE)
+    }
+
+    /// Constructor that lets callers override the CLOB base URL.
+    /// Intended for localhost A/B benchmarks and tests; production
+    /// callers should use `new`, which pins to `CLOB_BASE`.
+    pub fn with_base_url(
+        hex_key: &str,
+        nonce_path: PathBuf,
+        dry_run: bool,
+        fee_rate_bps: u32,
+        base_url: &str,
     ) -> anyhow::Result<Self> {
         let signer = Eip712Signer::from_hex(hex_key)?;
         let raw_signer: alloy_signer_local::PrivateKeySigner =
@@ -125,7 +141,14 @@ impl TradingClient {
             .pool_max_idle_per_host(8)
             .connect_timeout(Duration::from_secs(5))
             .build()?;
-        let order_url = Url::parse(&format!("{CLOB_BASE}/order"))?;
+        // Normalize trailing slash so `join` produces the right path.
+        let base = if base_url.ends_with('/') {
+            base_url.to_string()
+        } else {
+            format!("{base_url}/")
+        };
+        let base_url = Url::parse(&base)?;
+        let order_url = base_url.join("order")?;
         Ok(Self {
             signer,
             raw_signer,
@@ -133,6 +156,7 @@ impl TradingClient {
             nonce,
             _nonce_store: nonce_store,
             http,
+            base_url,
             order_url,
             book_cache: Arc::new(RwLock::new(BookSnapshot::default())),
             dry_run,
@@ -187,7 +211,7 @@ impl TradingClient {
     }
 
     pub async fn fetch_book(&self, token_id: &str) -> Result<(), ClientError> {
-        let url = Url::parse(&format!("{CLOB_BASE}/book"))?;
+        let url = self.base_url.join("book")?;
         let mut snap: BookSnapshot = self
             .http
             .get(url)
