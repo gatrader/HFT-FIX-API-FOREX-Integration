@@ -220,7 +220,14 @@ impl TradingClient {
             req = req.header(k, v);
         }
         let resp = req.send().await?;
-        resp.error_for_status()?;
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(ClientError::Other(
+                format!("CLOB {status}: {body_text}"),
+            ));
+        }
+        tracing::info!(target: "order_response", status = %status, body = %body_text);
         Ok(())
     }
 }
