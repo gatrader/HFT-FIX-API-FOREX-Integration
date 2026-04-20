@@ -9,8 +9,30 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BookLevel {
+    #[serde(deserialize_with = "de_f64_str_or_num")]
     pub price: f64,
+    #[serde(deserialize_with = "de_f64_str_or_num")]
     pub size: f64,
+}
+
+// Polymarket's REST /book emits price and size as JSON strings
+// (e.g. "0.01"), while some other surfaces use bare numbers.
+// Accept both so the REST fallback path actually decodes.
+fn de_f64_str_or_num<'de, D>(d: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StrOrNum {
+        Num(f64),
+        Str(String),
+    }
+    match StrOrNum::deserialize(d)? {
+        StrOrNum::Num(n) => Ok(n),
+        StrOrNum::Str(s) => s.parse::<f64>().map_err(D::Error::custom),
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -101,5 +123,30 @@ mod tests {
         let json = r#"{ "bids": [], "asks": [] }"#;
         let b: BookSnapshot = serde_json::from_str(json).unwrap();
         assert!(b.last_updated_at.is_none());
+    }
+
+    #[test]
+    fn deserialize_polymarket_string_prices() {
+        // Real format from clob.polymarket.com /book: price/size are
+        // JSON strings, not numbers. Must still decode to f64.
+        let json = r#"{
+            "bids":[{"price":"0.24","size":"849170.25"}],
+            "asks":[{"price":"0.26","size":"59223.73"}]
+        }"#;
+        let b: BookSnapshot = serde_json::from_str(json).unwrap();
+        assert!((b.best_bid().unwrap() - 0.24).abs() < 1e-9);
+        assert!((b.best_ask().unwrap() - 0.26).abs() < 1e-9);
+        assert!((b.bids[0].size - 849170.25).abs() < 1e-3);
+    }
+
+    #[test]
+    fn deserialize_numeric_prices_still_work() {
+        let json = r#"{
+            "bids":[{"price":0.24,"size":849170.25}],
+            "asks":[{"price":0.26,"size":59223.73}]
+        }"#;
+        let b: BookSnapshot = serde_json::from_str(json).unwrap();
+        assert!((b.best_bid().unwrap() - 0.24).abs() < 1e-9);
+        assert!((b.best_ask().unwrap() - 0.26).abs() < 1e-9);
     }
 }
