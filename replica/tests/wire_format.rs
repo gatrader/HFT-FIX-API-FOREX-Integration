@@ -29,7 +29,7 @@ const TEST_KEY: &str =
 
 fn sample_order(maker: Address) -> ClobOrder {
     ClobOrder::new(
-        U256::from(42u64),                // salt
+        42u64,                            // salt (u64, matches py-clob-client)
         maker,
         U256::from(1_000_000u64),         // tokenId
         U256::from(50_000_000u64),        // makerAmount (0.5 * 100 shares * 1e6)
@@ -114,9 +114,8 @@ fn json_wire_shape_matches_polymarket_schema() {
         );
     }
 
-    // Large numerics must be strings (U256 range); sigtype numeric.
+    // Large numerics must be strings (U256 range); salt + sigtype numeric.
     for f in [
-        "salt",
         "tokenId",
         "makerAmount",
         "takerAmount",
@@ -129,6 +128,8 @@ fn json_wire_shape_matches_polymarket_schema() {
             "field {f} must serialize as string (avoids JSON precision loss)"
         );
     }
+    // Salt must be a JSON NUMBER — server parses into Go int64.
+    assert!(json["salt"].is_number(), "salt must serialize as JSON number");
     // Side is an uppercase string ("BUY"/"SELL") per the live CLOB schema.
     assert!(json["side"].is_string());
     assert_eq!(json["side"].as_str().unwrap(), "BUY");

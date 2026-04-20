@@ -7,7 +7,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, U256};
 use parking_lot::RwLock;
@@ -22,7 +21,6 @@ use crate::order::{ClobOrder, Side};
 use crate::signer::Eip712Signer;
 
 pub const CLOB_BASE: &str = "https://clob.polymarket.com";
-pub const EXPIRATION_WINDOW_SECS: u64 = 60;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -52,13 +50,16 @@ pub struct SignedOrder {
 }
 
 /// Outer envelope for POST /order (Polymarket CLOB).
-/// Carries the signed order plus auth ownership + time-in-force.
+/// Carries the signed order plus auth ownership, time-in-force,
+/// and the postOnly flag (py-clob-client always emits `false`).
 #[derive(Serialize)]
 struct OrderEnvelope<'a> {
     order: &'a SignedOrder,
     owner: &'a str,
     #[serde(rename = "orderType")]
     order_type: &'a str,
+    #[serde(rename = "postOnly")]
+    post_only: bool,
 }
 
 pub struct TradingClient {
@@ -139,18 +140,11 @@ impl TradingClient {
         Ok(n)
     }
 
-    fn fresh_salt() -> U256 {
-        let mut buf = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut buf);
-        U256::from_be_bytes(buf)
-    }
-
-    fn expiration(&self) -> U256 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        U256::from(now + EXPIRATION_WINDOW_SECS)
+    /// Fresh salt in the u64 range, matching py-clob-client. The
+    /// order-api unmarshals salt into a Go int64, so a 256-bit
+    /// value gets rejected as "Invalid order payload".
+    fn fresh_salt() -> u64 {
+        rand::thread_rng().next_u64() >> 1 // keep positive in i64 range
     }
 
     pub async fn fetch_book(&self, token_id: &str) -> Result<(), ClientError> {
@@ -187,8 +181,8 @@ impl TradingClient {
             token_id,
             maker_amount,
             taker_amount,
-            self.expiration(),
-            U256::ZERO,
+            U256::ZERO, // expiration=0 => GTC per Polymarket CLOB
+            U256::ZERO, // order.nonce: CTF cancel nonce, not request counter
             U256::from(self.fee_rate_bps),
             side,
         );
@@ -219,6 +213,7 @@ impl TradingClient {
             order: &signed,
             owner: &creds.api_key,
             order_type: "GTC",
+            post_only: false,
         };
         let body = serde_json::to_string(&envelope)
             .map_err(|e| ClientError::Other(e.to_string()))?;

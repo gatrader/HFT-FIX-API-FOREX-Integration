@@ -48,7 +48,10 @@ sol! {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClobOrder {
-    pub salt: String,
+    /// u64 on the wire (JSON number). Polymarket's order-api
+    /// unmarshals salt into a Go int64 — a 256-bit string is
+    /// rejected as "Invalid order payload".
+    pub salt: u64,
     pub maker: Address,
     pub signer: Address,
     pub taker: Address,
@@ -65,7 +68,7 @@ pub struct ClobOrder {
 impl ClobOrder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        salt: U256,
+        salt: u64,
         maker: Address,
         token_id: U256,
         maker_amount: U256,
@@ -76,7 +79,7 @@ impl ClobOrder {
         side: Side,
     ) -> Self {
         Self {
-            salt: salt.to_string(),
+            salt,
             maker,
             signer: maker,
             taker: Address::ZERO,
@@ -96,7 +99,7 @@ impl ClobOrder {
 
     pub fn to_eip712(&self) -> Order {
         Order {
-            salt: self.salt.parse().expect("salt"),
+            salt: U256::from(self.salt),
             maker: self.maker,
             signer: self.signer,
             taker: self.taker,
