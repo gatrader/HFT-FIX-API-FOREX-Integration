@@ -67,6 +67,17 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         fee_rate_bps: u32,
     },
+    /// Connect to the Polymarket WS market channel, subscribe to
+    /// a token, and print observability stats every second.
+    /// Exercise harness for PR 2; not part of any trading path.
+    #[cfg(feature = "ws")]
+    WsProbe {
+        #[arg(long)]
+        token_id: String,
+        /// Seconds to run before exiting.
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -117,6 +128,43 @@ async fn main() -> Result<()> {
             )?;
             load_creds_into(&cli.creds, &client)?;
             run_one(&cfg, &client, token, net_position).await
+        }
+
+        #[cfg(feature = "ws")]
+        Cmd::WsProbe { token_id, seconds } => {
+            use std::sync::Arc;
+            use parking_lot::RwLock;
+            use arbigab_replica::book::BookSnapshot;
+            use arbigab_replica::ws::{WsClient, WsStats};
+
+            let cache = Arc::new(RwLock::new(BookSnapshot::default()));
+            let stats = Arc::new(WsStats::default());
+            let client = WsClient::new(
+                vec![token_id.clone()], cache.clone(), stats.clone(),
+            );
+            // Drive the reconnect loop on a detached task so we can
+            // print stats on our cadence.
+            tokio::spawn(async move { let _ = client.run().await; });
+
+            for _ in 0..seconds {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let age = stats.last_ws_message_age_ms();
+                let (bid, ask) = {
+                    let r = cache.read();
+                    (r.best_bid(), r.best_ask())
+                };
+                tracing::info!(
+                    target: "ws_probe",
+                    connected = stats.ws_connected(),
+                    reconnects = stats.ws_reconnect_count(),
+                    last_msg_age_ms = ?age,
+                    fallbacks = stats.ws_fallback_to_rest_count(),
+                    best_bid = ?bid,
+                    best_ask = ?ask,
+                    "probe tick"
+                );
+            }
+            Ok(())
         }
     }
 }

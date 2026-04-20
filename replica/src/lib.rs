@@ -16,5 +16,8 @@ pub mod order;
 pub mod signer;
 pub mod state_machine;
 
+#[cfg(feature = "ws")]
+pub mod ws;
+
 pub use config::{BotConfig, SpreadConfig, TradeSideMode};
 pub use order::{ClobOrder, Side};
