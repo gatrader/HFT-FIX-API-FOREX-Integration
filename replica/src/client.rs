@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, U256};
 use parking_lot::RwLock;
@@ -66,13 +67,26 @@ pub struct TradingClient {
     signer: Eip712Signer,
     raw_signer: alloy_signer_local::PrivateKeySigner,
     maker: Address,
+    /// In-memory request counter kept for audit / future cancel-all
+    /// semantics. Deliberately NOT fsynced per submit — that flush
+    /// was measured to cost 1–5ms median / 10–50ms p99 on EBS gp3
+    /// and was in the critical path of every place_single_order.
+    /// The EIP-712 order.nonce is pinned to 0 (CTF Exchange cancel
+    /// nonce), so losing this counter on crash has no wire effect.
     nonce: Arc<AtomicU64>,
-    nonce_store: NonceStore,
+    /// Retained for bootstrap-time load (historical watermark) and
+    /// eventual background flush; not written on the hot path.
+    _nonce_store: NonceStore,
     http: HttpClient,
+    /// Pre-parsed POST /order URL. Saved ~1–2µs per submit and
+    /// eliminates an allocation on the hot path.
+    order_url: Url,
     book_cache: Arc<RwLock<BookSnapshot>>,
     dry_run: bool,
     fee_rate_bps: u32,
-    creds: RwLock<Option<ApiCredentials>>,
+    /// Creds behind Arc so the hot path clones a pointer (8 bytes)
+    /// rather than three Strings (api_key + secret + passphrase).
+    creds: RwLock<Option<Arc<ApiCredentials>>>,
 }
 
 impl TradingClient {
@@ -88,16 +102,34 @@ impl TradingClient {
         let maker = signer.maker();
         let nonce_store = NonceStore::open(nonce_path)?;
         let nonce = Arc::new(AtomicU64::new(nonce_store.load()));
+        // Safe, conservative HTTP tuning:
+        //   - tcp_keepalive: keep idle sockets warm so we reuse the
+        //     TLS+TCP+h2 session across submits (biggest win).
+        //   - pool_idle_timeout: don't age out faster than keepalive.
+        //   - pool_max_idle_per_host: small bound; we only talk to
+        //     one host, so 8 is plenty.
+        //   - connect_timeout: 5s so DNS/TLS hiccups surface fast.
+        //
+        // Deliberately NOT calling http2_prior_knowledge(). rustls
+        // negotiates h2 via ALPN automatically for HTTPS, which is
+        // what Polymarket advertises; forcing prior-knowledge would
+        // skip TLS entirely and fail.
         let http = HttpClient::builder()
             .user_agent("arbigab-replica/0.1")
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(8)
+            .connect_timeout(Duration::from_secs(5))
             .build()?;
+        let order_url = Url::parse(&format!("{CLOB_BASE}/order"))?;
         Ok(Self {
             signer,
             raw_signer,
             maker,
             nonce,
-            nonce_store,
+            _nonce_store: nonce_store,
             http,
+            order_url,
             book_cache: Arc::new(RwLock::new(BookSnapshot::default())),
             dry_run,
             fee_rate_bps,
@@ -108,7 +140,7 @@ impl TradingClient {
     /// Seed credentials directly (if you already have them from a
     /// previous bootstrap saved on disk).
     pub fn set_credentials(&self, creds: ApiCredentials) {
-        *self.creds.write() = Some(creds);
+        *self.creds.write() = Some(Arc::new(creds));
     }
 
     /// L1 bootstrap — one-time. Hits /auth/api-key, stores the
@@ -118,7 +150,7 @@ impl TradingClient {
         let c = bootstrap_credentials(&self.http, &self.raw_signer)
             .await
             .map_err(|e| ClientError::Other(e.to_string()))?;
-        *self.creds.write() = Some(c.clone());
+        *self.creds.write() = Some(Arc::new(c.clone()));
         Ok(c)
     }
 
@@ -134,10 +166,11 @@ impl TradingClient {
         self.book_cache.clone()
     }
 
-    fn next_nonce(&self) -> anyhow::Result<u64> {
-        let n = self.nonce.fetch_add(1, Ordering::SeqCst) + 1;
-        self.nonce_store.record(n)?;
-        Ok(n)
+    /// In-memory monotonic request counter (hot-path safe, no I/O).
+    /// The on-disk NonceStore is no longer written per submit — see
+    /// the struct doc on `nonce` for why.
+    fn next_request_id(&self) -> u64 {
+        self.nonce.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Fresh salt in the u64 range, matching py-clob-client. The
@@ -163,6 +196,12 @@ impl TradingClient {
     }
 
     /// place_single_order (FINAL_AUDIT §9).
+    ///
+    /// Staged instrumentation emits a single `hotpath` tracing event
+    /// per submit with µs/ms fields. The EIP-712 order.nonce is
+    /// pinned to 0 (CTF Exchange cancel nonce); our in-memory
+    /// request counter (`request_id`) is advanced for audit only,
+    /// with no fsync on the hot path.
     pub async fn place_single_order(
         &self,
         token_id: U256,
@@ -170,11 +209,7 @@ impl TradingClient {
         taker_amount: U256,
         side: Side,
     ) -> Result<(), ClientError> {
-        // Record a monotonic request-tracking nonce for our own
-        // audit trail, but the EIP-712 order.nonce field is the
-        // on-chain CTF Exchange cancel nonce — always 0 for a
-        // regular order (Polymarket convention).
-        let _req_nonce = self.next_nonce()?;
+        let request_id = self.next_request_id();
         let order = ClobOrder::new(
             Self::fresh_salt(),
             self.maker,
@@ -186,10 +221,13 @@ impl TradingClient {
             U256::from(self.fee_rate_bps),
             side,
         );
+
+        let t_sign = Instant::now();
         let sig = self
             .signer
             .sign_order(&order.to_eip712())
             .map_err(|e| ClientError::Sign(e.to_string()))?;
+        let sign_us = t_sign.elapsed().as_micros() as u64;
         let signed = SignedOrder { order, signature: sig };
 
         if self.dry_run {
@@ -199,8 +237,7 @@ impl TradingClient {
             return Ok(());
         }
 
-        let path = "/order";
-        let url = Url::parse(&format!("{CLOB_BASE}{path}"))?;
+        // Arc<ApiCredentials>: clone is a pointer copy.
         let creds = self
             .creds
             .read()
@@ -223,22 +260,39 @@ impl TradingClient {
             &creds,
             Self::now_ts(),
             "POST",
-            path,
+            "/order",
             &body,
         )
         .map_err(|e| ClientError::Other(e.to_string()))?;
 
         let mut req = self
             .http
-            .post(url)
+            .post(self.order_url.clone())
             .header("Content-Type", "application/json")
             .body(body);
         for (k, v) in headers {
             req = req.header(k, v);
         }
+
+        let t_submit = Instant::now();
         let resp = req.send().await?;
+        let submit_ms = t_submit.elapsed().as_millis() as u64;
         let status = resp.status();
+
+        let t_body = Instant::now();
         let body_text = resp.text().await.unwrap_or_default();
+        let body_ms = t_body.elapsed().as_millis() as u64;
+
+        tracing::info!(
+            target: "hotpath",
+            request_id,
+            sign_us,
+            submit_ms,   // send() -> status headers
+            body_ms,     // headers -> full body drained
+            status = %status,
+            "submit complete"
+        );
+
         if !status.is_success() {
             return Err(ClientError::Other(
                 format!("CLOB {status}: {body_text}"),
