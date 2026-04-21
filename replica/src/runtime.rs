@@ -607,15 +607,22 @@ impl Runtime {
     }
 
     /// Send a CancelJob::Open to the worker if the dedup window
-    /// has elapsed. No-op when the cancel queue isn't wired
-    /// (pre-B behaviour) or when the window is still hot.
+    /// has elapsed AND the registry has at least one open order.
+    /// No-op when the cancel queue isn't wired (pre-B behaviour),
+    /// when the window is still hot, or when there's nothing to
+    /// cancel.
     ///
-    /// The worker snapshots `open_order_ids()` at send-time, so
-    /// this function does not need to consult the registry — we
-    /// can call it even if there are no open orders and the
-    /// worker will coalesce to a no-op.
-    fn enqueue_cancel_if_needed(&self) {
+    /// The empty-registry short-circuit matters because the state
+    /// machine emits Cancel* decisions even on a flat book during
+    /// the unwinder's post-flat pause. Without it, every such tick
+    /// would consume a channel slot and advance the dedup window
+    /// for a no-op, making the `cancel_count` metric noisy and
+    /// inflating the observed cancel rate.
+    fn enqueue_cancel_if_needed(&self, client: &TradingClient) {
         let Some(tx) = &self.cancel_tx else { return };
+        if client.open_order_count() == 0 {
+            return;
+        }
         let now = Instant::now();
         {
             let last = self.last_cancel_at.read();
@@ -708,7 +715,7 @@ impl Runtime {
                 (side, price, size, maker_amount, taker_amount)
             }
             Decision::CancelPrimary | Decision::CancelSecondary => {
-                self.enqueue_cancel_if_needed();
+                self.enqueue_cancel_if_needed(client);
                 return Ok(());
             }
             Decision::Skip => return Ok(()),
@@ -743,7 +750,7 @@ impl Runtime {
                     size,
                     "stale open order present; enqueue cancel instead of stacking"
                 );
-                self.enqueue_cancel_if_needed();
+                self.enqueue_cancel_if_needed(client);
                 return Ok(());
             }
         }
@@ -1238,5 +1245,70 @@ mod tests {
         // but still measurable as elapsed > 0).
         // Note: dry_run can complete in <1µs on fast machines,
         // so we only assert the side effect ran (queue drained).
+    }
+
+    /// `enqueue_cancel_if_needed` should be a no-op when the
+    /// registry is empty. Otherwise every Cancel* decision on a
+    /// flat book consumes a channel slot and advances the dedup
+    /// window for no reason — polluting `cancel_count` and
+    /// masking the real cancel rate in operator dashboards.
+    #[tokio::test]
+    async fn enqueue_cancel_skips_on_empty_registry() {
+        use crate::client::TradingClient;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let key = "0000000000000000000000000000000000000000000000000000000000000001";
+        let client = TradingClient::new(key, dir.path().join("nonce"), true, 0)
+            .unwrap();
+        // Capacity 1: if we ever enqueued, a second call would
+        // count as a full-queue drop.
+        let (tx, mut rx) = mpsc::channel::<CancelJob>(1);
+        let cfg = RuntimeConfig {
+            cancel_dedup_ms: 0, // disable dedup gate for this test
+            ..RuntimeConfig::default()
+        };
+        let rt = stub_runtime(cfg).with_cancel_queue(tx);
+
+        // Registry is empty (TradingClient::new() starts flat).
+        for _ in 0..3 {
+            rt.enqueue_cancel_if_needed(&client);
+        }
+        assert_eq!(rt.stats.cancel_queue_full_drops(), 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing should have been enqueued on an empty registry"
+        );
+    }
+
+    /// With at least one open order, `enqueue_cancel_if_needed`
+    /// must actually send. Guards against a regression where the
+    /// empty-registry short-circuit also blocks the non-empty case.
+    #[tokio::test]
+    async fn enqueue_cancel_sends_when_registry_nonempty() {
+        use crate::client::{OpenOrder, TradingClient};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let key = "0000000000000000000000000000000000000000000000000000000000000001";
+        let client = TradingClient::new(key, dir.path().join("nonce"), true, 0)
+            .unwrap();
+        client.record_open_order(OpenOrder {
+            order_id: "oid".into(),
+            token_id: "tkn".into(),
+            side: Side::Buy,
+            price: 0.5,
+            size: 10.0,
+            placed_at: Instant::now(),
+        });
+        let (tx, mut rx) = mpsc::channel::<CancelJob>(4);
+        let cfg = RuntimeConfig {
+            cancel_dedup_ms: 0,
+            ..RuntimeConfig::default()
+        };
+        let rt = stub_runtime(cfg).with_cancel_queue(tx);
+        rt.enqueue_cancel_if_needed(&client);
+        assert!(
+            matches!(rx.try_recv(), Ok(CancelJob::Open)),
+            "expected one CancelJob::Open enqueued"
+        );
     }
 }
