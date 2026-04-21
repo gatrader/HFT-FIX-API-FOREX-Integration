@@ -37,6 +37,24 @@ pub enum State {
     Stop,
 }
 
+/// Polymarket quote tick. Live quoting off-tick (e.g. `0.5819998`)
+/// is rejected by the venue with `Invalid price`, silently drops
+/// maker orders, and wastes a tick. We snap each computed quote to
+/// this grid before emitting. Buy orders quantize **down** so we
+/// never accidentally cross the spread into a taker buy; sell
+/// orders quantize **up** so we never cross into a taker sell.
+pub const PRICE_TICK: f64 = 0.001;
+
+/// Snap `price` to the nearest tick at or below it.
+pub fn quantize_price_down(price: f64, tick: f64) -> f64 {
+    (price / tick).floor() * tick
+}
+
+/// Snap `price` to the nearest tick at or above it.
+pub fn quantize_price_up(price: f64, tick: f64) -> f64 {
+    (price / tick).ceil() * tick
+}
+
 /// Market-level inputs injected each tick. In the artifact,
 /// `net_position` is tracked internally via fill callbacks; for
 /// the replica it's provided by the caller of `tick`.
@@ -121,13 +139,20 @@ impl SpreadCapture {
         // identifies surplus (§33 / FINAL_AUDIT §8).
         self.spread_cfg.decay(surplus);
 
-        let price = match side {
+        let raw_price = match side {
             Side::Buy => self
                 .min_price
                 .max(tick.book.best_bid().unwrap_or(self.min_price)),
             Side::Sell => self
                 .max_price
                 .min(tick.book.best_ask().unwrap_or(self.max_price)),
+        };
+        // Snap to the venue tick before encoding. Without this, a
+        // best-bid that arrives as `0.5819998` (rest-path JSON
+        // rounding) produces an off-tick quote the CLOB rejects.
+        let price = match side {
+            Side::Buy => quantize_price_down(raw_price, PRICE_TICK),
+            Side::Sell => quantize_price_up(raw_price, PRICE_TICK),
         };
         let size = self.spread_cfg.order_size;
         let (maker_amount, taker_amount) = encode_amounts(side, price, size);
@@ -214,10 +239,17 @@ pub enum Decision {
 ///
 /// BUY:  taker_amount = shares, maker_amount = price * shares
 /// SELL: maker_amount = shares, taker_amount = price * shares
+///
+/// `.round()` rather than truncation: f64 can't encode every
+/// 6-decimal value exactly, so `0.581 * 10.0 * 1e6` evaluates to
+/// `5_809_999.999…`. Truncating via `as u128` drops that to
+/// `5_809_999`, which signs as the wrong integer and either gets
+/// rejected by the CLOB or posts an off-by-one-micro order. Round
+/// to the nearest micro instead.
 pub fn encode_amounts(side: Side, price: f64, size: f64) -> (U256, U256) {
     let scale = 1_000_000.0;
-    let shares = (size * scale) as u128;
-    let notional = (price * size * scale) as u128;
+    let shares = (size * scale).round() as u128;
+    let notional = (price * size * scale).round() as u128;
     match side {
         Side::Buy => (U256::from(notional), U256::from(shares)),
         Side::Sell => (U256::from(shares), U256::from(notional)),
@@ -240,5 +272,40 @@ mod tests {
         let (m, t) = encode_amounts(Side::Sell, 0.50, 100.0);
         assert_eq!(m, U256::from(100_000_000u128));
         assert_eq!(t, U256::from(50_000_000u128));
+    }
+
+    #[test]
+    fn quantize_down_snaps_off_tick_to_nearest_lower_tick() {
+        // 0.5819998 — classic f64 round-trip on a REST tick reply.
+        // BUY must go to 0.581, never 0.582 (would cross the spread).
+        assert!((quantize_price_down(0.5819998, PRICE_TICK) - 0.581).abs() < 1e-9);
+        // On-tick input is a no-op.
+        assert!((quantize_price_down(0.581, PRICE_TICK) - 0.581).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quantize_up_snaps_off_tick_to_nearest_higher_tick() {
+        // SELL side: 0.5800002 must go to 0.581, never 0.580.
+        assert!((quantize_price_up(0.5800002, PRICE_TICK) - 0.581).abs() < 1e-9);
+        // On-tick input is a no-op.
+        assert!((quantize_price_up(0.581, PRICE_TICK) - 0.581).abs() < 1e-9);
+    }
+
+    #[test]
+    fn encode_amounts_rounds_rather_than_truncates() {
+        // 0.581 * 10 * 1e6 evaluates to 5_809_999.999…; truncating
+        // drops it to 5_809_999, which is the regression live
+        // validation exposed. Rounding gives 5_810_000.
+        let (m, _) = encode_amounts(Side::Buy, 0.581, 10.0);
+        assert_eq!(m, U256::from(5_810_000u128));
+    }
+
+    #[test]
+    fn encode_amounts_rounds_size_exactly() {
+        // 0.1 * 1e6 evaluates to 99_999.999…; truncation gives
+        // 99_999 (silently loses a micro-share). Round trip must
+        // give exactly 100_000.
+        let (_, t) = encode_amounts(Side::Buy, 0.50, 0.1);
+        assert_eq!(t, U256::from(100_000u128));
     }
 }
