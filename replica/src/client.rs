@@ -16,7 +16,7 @@ use rand::RngCore;
 use reqwest::{Client as HttpClient, Url};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{bootstrap_credentials, l2_headers, ApiCredentials};
+use crate::auth::{bootstrap_credentials, derive_credentials, l2_headers, ApiCredentials};
 use crate::book::BookSnapshot;
 use crate::nonce_store::NonceStore;
 use crate::order::{ClobOrder, Side};
@@ -231,6 +231,18 @@ impl TradingClient {
     /// can also persist them to disk if desired.
     pub async fn bootstrap(&self) -> Result<ApiCredentials, ClientError> {
         let c = bootstrap_credentials(&self.http, &self.raw_signer)
+            .await
+            .map_err(|e| ClientError::Other(e.to_string()))?;
+        *self.creds.write() = Some(Arc::new(c.clone()));
+        Ok(c)
+    }
+
+    /// Recover the credentials already registered for this EOA via
+    /// GET /auth/derive-api-key. Use when bootstrap returns 400
+    /// "Could not create api key" because the wallet has been
+    /// bootstrapped in a previous session.
+    pub async fn derive(&self) -> Result<ApiCredentials, ClientError> {
+        let c = derive_credentials(&self.http, &self.raw_signer)
             .await
             .map_err(|e| ClientError::Other(e.to_string()))?;
         *self.creds.write() = Some(Arc::new(c.clone()));
@@ -630,6 +642,19 @@ impl TradingClient {
         );
 
         if !status.is_success() {
+            let (price, size) = decode_price_size(&signed.order);
+            let body_preview = truncate_for_log(&body_text, 4_096);
+            tracing::warn!(
+                target: "order_reject",
+                request_id,
+                status = %status,
+                side = %signed.order.side,
+                price,
+                size,
+                token_id = %signed.order.token_id,
+                body = %body_preview,
+                "CLOB /order rejected"
+            );
             return Err(ClientError::Other(
                 format!("CLOB {status}: {body_text}"),
             ));
@@ -647,23 +672,12 @@ impl TradingClient {
         // (non-dry-run, 2xx) path.
         if let Ok(resp) = serde_json::from_str::<OrderPostResponse>(&body_text) {
             if let Some(oid) = resp.order_id {
-                // Decode price/size back out of the order struct.
-                // `makerAmount` and `takerAmount` are stored as strings
-                // of 6-decimal integers (Polymarket's convention).
-                let m = signed.order.maker_amount.parse::<u128>().unwrap_or(0) as f64;
-                let t = signed.order.taker_amount.parse::<u128>().unwrap_or(0) as f64;
                 let side = if signed.order.side == "BUY" {
                     Side::Buy
                 } else {
                     Side::Sell
                 };
-                let (price, size) = match side {
-                    // BUY: maker = notional (price*size*scale), taker = size*scale
-                    Side::Buy if t > 0.0 => (m / t, t / 1_000_000.0),
-                    // SELL: maker = size*scale, taker = notional
-                    Side::Sell if m > 0.0 => (t / m, m / 1_000_000.0),
-                    _ => (0.0, 0.0),
-                };
+                let (price, size) = decode_price_size(&signed.order);
                 self.record_open_order(OpenOrder {
                     order_id: oid.clone(),
                     token_id: signed.order.token_id.clone(),
@@ -694,4 +708,111 @@ pub struct PreparedSubmit {
     pub signed: SignedOrder,
     pub request_id: u64,
     pub sign_us: u64,
+}
+
+/// Decode price/size back out of the signed order. `makerAmount`
+/// and `takerAmount` are the Polymarket wire format: 6-decimal
+/// scaled integers serialized as strings. Used by the order_reject
+/// warn (where the response body is opaque but the order we sent
+/// is known) and by the registry-insert on success.
+fn decode_price_size(order: &ClobOrder) -> (f64, f64) {
+    let m = order.maker_amount.parse::<u128>().unwrap_or(0) as f64;
+    let t = order.taker_amount.parse::<u128>().unwrap_or(0) as f64;
+    match order.side.as_str() {
+        // BUY: maker = notional (price*size*scale), taker = size*scale.
+        "BUY" if t > 0.0 => (m / t, t / 1_000_000.0),
+        // SELL: maker = size*scale, taker = notional.
+        "SELL" if m > 0.0 => (t / m, m / 1_000_000.0),
+        _ => (0.0, 0.0),
+    }
+}
+
+/// Clip a string at `limit` chars on a UTF-8 boundary so the
+/// order_reject warn never spills a multi-megabyte HTML error
+/// page into the logs. Returns the input unchanged when it fits.
+fn truncate_for_log(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
+        return s.to_string();
+    }
+    // Walk forward from `limit` to the nearest valid UTF-8 boundary.
+    // `is_char_boundary(limit)` returns true at multi-byte starts too,
+    // so we'll land on a codepoint boundary and never panic.
+    let mut end = limit;
+    while end < s.len() && !s.is_char_boundary(end) {
+        end += 1;
+    }
+    let mut out = String::with_capacity(end + 16);
+    out.push_str(&s[..end]);
+    out.push_str("…[truncated]");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_order(side_str: &str, maker_amount: &str, taker_amount: &str) -> ClobOrder {
+        ClobOrder {
+            salt: 0,
+            maker: Address::ZERO,
+            signer: Address::ZERO,
+            taker: Address::ZERO,
+            token_id: "0".into(),
+            maker_amount: maker_amount.into(),
+            taker_amount: taker_amount.into(),
+            expiration: "0".into(),
+            nonce: "0".into(),
+            fee_rate_bps: "0".into(),
+            side: side_str.into(),
+            signature_type: 0,
+        }
+    }
+
+    #[test]
+    fn decode_price_size_buy() {
+        // BUY 10 shares at 0.5 → taker=size*1e6=10_000_000;
+        // maker=notional=5_000_000.
+        let o = mk_order("BUY", "5000000", "10000000");
+        let (price, size) = decode_price_size(&o);
+        assert!((price - 0.5).abs() < 1e-9);
+        assert!((size - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decode_price_size_sell() {
+        // SELL 10 shares at 0.7 → maker=size*1e6=10_000_000;
+        // taker=notional=7_000_000.
+        let o = mk_order("SELL", "10000000", "7000000");
+        let (price, size) = decode_price_size(&o);
+        assert!((price - 0.7).abs() < 1e-9);
+        assert!((size - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decode_price_size_handles_zero() {
+        let o = mk_order("BUY", "0", "0");
+        assert_eq!(decode_price_size(&o), (0.0, 0.0));
+    }
+
+    #[test]
+    fn truncate_passthrough_when_short() {
+        assert_eq!(truncate_for_log("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_clips_with_marker() {
+        let s = "a".repeat(100);
+        let out = truncate_for_log(&s, 10);
+        assert!(out.starts_with("aaaaaaaaaa"));
+        assert!(out.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn truncate_respects_utf8_boundary() {
+        // 4-byte codepoint right at the cut point.
+        let s = format!("{}{}", "a".repeat(9), "🦀🦀🦀");
+        let out = truncate_for_log(&s, 10);
+        // Must not panic and must leave a valid String.
+        assert!(out.is_char_boundary(out.len()));
+    }
 }
