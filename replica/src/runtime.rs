@@ -38,7 +38,7 @@ use crate::book::BookSnapshot;
 use crate::client::{PreparedSubmit, TradingClient};
 use crate::order::Side;
 use crate::position::Position;
-use crate::state_machine::{Decision, SpreadCapture, Tick};
+use crate::state_machine::{Decision, SpreadCapture, Tick, PRICE_TICK};
 
 #[cfg(feature = "ws")]
 use crate::ws::WsStats;
@@ -690,6 +690,40 @@ impl Runtime {
             Decision::Skip => return Ok(()),
         };
 
+        // Stacking guard: consult the local open-order registry
+        // before emitting. Prices are already venue-tick quantized
+        // in the state machine, so half-tick eps is tight enough
+        // to match "same level" without over-matching on f64 jitter.
+        //
+        //   matching on (side, price) → skip: same quote is already
+        //     resting; a second submit would stack inventory at the
+        //     same level and blow the maker budget.
+        //   stale on same side at a different price → cancel: the
+        //     state machine has moved; layering a new order on top
+        //     of the old one accumulates dead quotes.
+        //   otherwise → emit normally.
+        let tick_eps = PRICE_TICK / 2.0;
+        if client.has_matching_open_order(side, price, tick_eps) {
+            tracing::debug!(
+                target: "runtime",
+                side = ?side,
+                price,
+                "matching open order already live; skipping emit"
+            );
+            return Ok(());
+        }
+        if client.has_stale_open_order_on_side(side, price, tick_eps) {
+            tracing::info!(
+                target: "runtime",
+                side = ?side,
+                price,
+                open_count = client.open_order_count(),
+                "stale on-side open order; cancelling before new emit"
+            );
+            self.enqueue_cancel_if_needed(client);
+            return Ok(());
+        }
+
         let now = Instant::now();
         match self.decide_emit(side, price, size, now) {
             EmitDecision::Suppressed(_) => return Ok(()),
@@ -1213,5 +1247,134 @@ mod tests {
             matches!(rx.try_recv(), Ok(CancelJob::Open)),
             "expected one CancelJob::Open enqueued"
         );
+    }
+
+    // ── Stacking-guard tests ──────────────────────────────────────
+    //
+    // Live validation against the CLOB on 2026-04 showed that the
+    // state machine, unconstrained, would re-submit an identical
+    // quote every tick even while the previous one was still resting
+    // on the book. The three tests below pin the three cases:
+    //   * matching open order → skip emit, nothing enqueued
+    //   * stale on-side order → cancel enqueued, no submit
+    //   * clean registry     → submit enqueued as normal
+
+    /// Seeds the runtime + client with a book that forces a Sell
+    /// emit at 0.51. Shared setup so the three tests below only
+    /// differ in what's pre-loaded into the open-order registry.
+    fn seed_emit_ready_runtime(
+    ) -> (Runtime, Arc<crate::client::TradingClient>, tempfile::TempDir) {
+        use crate::book::BookLevel;
+        use crate::client::TradingClient;
+        use crate::config::{SpreadConfig, TradeSideMode};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let key = "0000000000000000000000000000000000000000000000000000000000000001";
+        let client = Arc::new(
+            TradingClient::new(key, dir.path().join("nonce"), true, 0).unwrap(),
+        );
+        let book = client.book_cache();
+        {
+            let mut b = book.write();
+            b.bids = vec![BookLevel { price: 0.49, size: 100.0 }];
+            b.asks = vec![BookLevel { price: 0.51, size: 100.0 }];
+            b.stamp_now();
+        }
+        let sc = SpreadConfig {
+            order_size: 1.0,
+            edge_threshold: 0.005,
+            target_spread: 0.005,
+            trade_side: TradeSideMode::Both,
+        };
+        let sm = SpreadCapture::new(sc, 5.0, 0.01, 0.99);
+        let cfg = RuntimeConfig {
+            tick_interval_ms: 150,
+            book_max_age_ms: 60_000,
+            dedup_window_ms: 0,
+            submit_budget_per_sec: 100,
+            cancel_dedup_ms: 0,
+            ..RuntimeConfig::default()
+        };
+        let stats = Arc::new(RuntimeStats::default());
+        let rt = Runtime::new(cfg, sm, book.clone(), stats);
+        (rt, client, dir)
+    }
+
+    #[tokio::test]
+    async fn run_tick_skips_emit_when_matching_open_order_present() {
+        use crate::client::OpenOrder;
+        let (mut rt, client, _d) = seed_emit_ready_runtime();
+        // Runtime would emit Sell @ 0.51; a matching resting order
+        // at the same level should short-circuit the submit.
+        client.record_open_order(OpenOrder {
+            order_id: "resting".into(),
+            token_id: "tkn".into(),
+            side: Side::Sell,
+            price: 0.51,
+            size: 1.0,
+            placed_at: Instant::now(),
+        });
+        let (submit_tx, mut submit_rx) = mpsc::channel::<SubmitJob>(4);
+        let (cancel_tx, mut cancel_rx) = mpsc::channel::<CancelJob>(4);
+        rt.submit_tx = Some(submit_tx);
+        rt.cancel_tx = Some(cancel_tx);
+        rt.set_net_position(10.0);
+
+        rt.run_tick(U256::from(1u64), "1", &client).await.unwrap();
+
+        assert_eq!(rt.stats.queue_depth(), 0, "no submit should have been queued");
+        assert!(submit_rx.try_recv().is_err(), "submit queue should be empty");
+        assert!(cancel_rx.try_recv().is_err(), "no cancel should fire on match");
+    }
+
+    #[tokio::test]
+    async fn run_tick_enqueues_cancel_when_stale_on_side_order_present() {
+        use crate::client::OpenOrder;
+        let (mut rt, client, _d) = seed_emit_ready_runtime();
+        // Runtime wants Sell @ 0.51; a resting Sell at 0.60 is stale
+        // (state machine has moved). The guard should cancel before
+        // layering a replacement.
+        client.record_open_order(OpenOrder {
+            order_id: "stale".into(),
+            token_id: "tkn".into(),
+            side: Side::Sell,
+            price: 0.60,
+            size: 1.0,
+            placed_at: Instant::now(),
+        });
+        let (submit_tx, mut submit_rx) = mpsc::channel::<SubmitJob>(4);
+        let (cancel_tx, mut cancel_rx) = mpsc::channel::<CancelJob>(4);
+        rt.submit_tx = Some(submit_tx);
+        rt.cancel_tx = Some(cancel_tx);
+        rt.set_net_position(10.0);
+
+        rt.run_tick(U256::from(1u64), "1", &client).await.unwrap();
+
+        assert!(submit_rx.try_recv().is_err(), "submit must not fire on stale");
+        assert!(
+            matches!(cancel_rx.try_recv(), Ok(CancelJob::Open)),
+            "expected a CancelJob::Open to have been enqueued"
+        );
+        assert_eq!(rt.stats.queue_depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_tick_emits_when_registry_clean() {
+        // Pins the contract of the guard: with no open order on the
+        // target side, the tick must submit. Otherwise the guard
+        // would silently mute the strategy in the normal case.
+        let (mut rt, client, _d) = seed_emit_ready_runtime();
+        let (submit_tx, mut submit_rx) = mpsc::channel::<SubmitJob>(4);
+        let (cancel_tx, mut cancel_rx) = mpsc::channel::<CancelJob>(4);
+        rt.submit_tx = Some(submit_tx);
+        rt.cancel_tx = Some(cancel_tx);
+        rt.set_net_position(10.0);
+
+        rt.run_tick(U256::from(1u64), "1", &client).await.unwrap();
+
+        assert_eq!(rt.stats.queue_depth(), 1, "clean registry → submit enqueued");
+        assert!(submit_rx.try_recv().is_ok());
+        assert!(cancel_rx.try_recv().is_err());
     }
 }
