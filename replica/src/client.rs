@@ -427,6 +427,41 @@ impl TradingClient {
         self.open_orders.read().len()
     }
 
+    /// Returns `true` if the registry already contains an open
+    /// order on `side` whose price is within `tick_eps` of `price`.
+    /// The runtime uses this as a stacking guard — when the state
+    /// machine asks for a quote that matches what's already resting,
+    /// we skip the emit instead of doubling up on the same level.
+    pub fn has_matching_open_order(
+        &self,
+        side: Side,
+        price: f64,
+        tick_eps: f64,
+    ) -> bool {
+        self.open_orders
+            .read()
+            .values()
+            .any(|o| o.side == side && (o.price - price).abs() < tick_eps)
+    }
+
+    /// Returns `true` if the registry contains any open order on
+    /// the same `side` whose price differs from `price` by at least
+    /// `tick_eps` — i.e. an on-side quote the state machine has
+    /// since moved away from. The runtime uses this to issue a
+    /// cancel before layering a replacement so we don't accumulate
+    /// dead quotes at stale levels.
+    pub fn has_stale_open_order_on_side(
+        &self,
+        side: Side,
+        price: f64,
+        tick_eps: f64,
+    ) -> bool {
+        self.open_orders
+            .read()
+            .values()
+            .any(|o| o.side == side && (o.price - price).abs() >= tick_eps)
+    }
+
     /// Wall-clock ms-since-epoch of the last successful cancel on
     /// this client. `0` means the process has never cancelled. Used
     /// by the stats logger alongside `Position::last_fill_age_ms`.
@@ -965,6 +1000,68 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v.is_array(), "batch cancel body must be a JSON array");
         assert_eq!(v.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn has_matching_open_order_hits_on_same_side_and_price() {
+        let (c, _d) = mk_dry_client();
+        c.record_open_order(OpenOrder {
+            order_id: "A".into(),
+            token_id: "tkn".into(),
+            side: Side::Buy,
+            price: 0.581,
+            size: 10.0,
+            placed_at: Instant::now(),
+        });
+        let eps = 0.0005;
+        assert!(c.has_matching_open_order(Side::Buy, 0.581, eps));
+        // Within-eps counts as matching — covers f64 round-trip jitter.
+        assert!(c.has_matching_open_order(Side::Buy, 0.5812, eps));
+    }
+
+    #[test]
+    fn has_matching_open_order_misses_on_wrong_side_or_price() {
+        let (c, _d) = mk_dry_client();
+        c.record_open_order(OpenOrder {
+            order_id: "A".into(),
+            token_id: "tkn".into(),
+            side: Side::Buy,
+            price: 0.581,
+            size: 10.0,
+            placed_at: Instant::now(),
+        });
+        let eps = 0.0005;
+        // Opposite side at same price — not a match.
+        assert!(!c.has_matching_open_order(Side::Sell, 0.581, eps));
+        // Same side but the price has moved by a full tick.
+        assert!(!c.has_matching_open_order(Side::Buy, 0.582, eps));
+    }
+
+    #[test]
+    fn has_stale_on_side_sees_only_same_side_different_price() {
+        let (c, _d) = mk_dry_client();
+        c.record_open_order(OpenOrder {
+            order_id: "A".into(),
+            token_id: "tkn".into(),
+            side: Side::Buy,
+            price: 0.580,
+            size: 10.0,
+            placed_at: Instant::now(),
+        });
+        c.record_open_order(OpenOrder {
+            order_id: "B".into(),
+            token_id: "tkn".into(),
+            side: Side::Sell,
+            price: 0.620,
+            size: 10.0,
+            placed_at: Instant::now(),
+        });
+        let eps = 0.0005;
+        // Want to emit Buy@0.582: the Buy@0.580 is stale on this side.
+        assert!(c.has_stale_open_order_on_side(Side::Buy, 0.582, eps));
+        // Opposite-side quote (Sell@0.620) must not register as stale
+        // when we're emitting on the Buy side.
+        assert!(!c.has_stale_open_order_on_side(Side::Buy, 0.580, eps));
     }
 
     #[test]
