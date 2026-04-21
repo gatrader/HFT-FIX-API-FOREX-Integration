@@ -465,6 +465,12 @@ async fn main() -> Result<()> {
             // Ctrl-C at any point flushes open orders before the
             // process exits. Cloned client so the handler task
             // owns its own reference.
+            //
+            // The cancel_all call is wrapped in a bounded timeout.
+            // If the CLOB is hanging, the operator still gets a
+            // prompt process exit rather than needing to SIGKILL —
+            // orders left resting will be cleaned up by the next
+            // process's `--force-cancel-on-start` pass.
             let shutdown_client = client.clone();
             tokio::spawn(async move {
                 if let Err(e) = tokio::signal::ctrl_c().await {
@@ -472,17 +478,39 @@ async fn main() -> Result<()> {
                         error = %e, "ctrl_c listener failed");
                     return;
                 }
+                let open_before = shutdown_client.open_order_count();
                 tracing::warn!(
                     target: "shutdown",
-                    open = shutdown_client.open_order_count(),
+                    open = open_before,
                     "SIGINT received; cancelling open orders"
                 );
-                if let Err(e) = shutdown_client.cancel_all().await {
-                    tracing::error!(
+                let shutdown_cancel_timeout =
+                    std::time::Duration::from_secs(5);
+                let t0 = std::time::Instant::now();
+                match tokio::time::timeout(
+                    shutdown_cancel_timeout,
+                    shutdown_client.cancel_all(),
+                )
+                .await
+                {
+                    Ok(Ok(())) => tracing::info!(
+                        target: "shutdown",
+                        open_before,
+                        elapsed_ms = t0.elapsed().as_millis() as u64,
+                        "cancel_all on shutdown ok"
+                    ),
+                    Ok(Err(e)) => tracing::error!(
                         target: "shutdown",
                         error = %e,
+                        elapsed_ms = t0.elapsed().as_millis() as u64,
                         "cancel_all on shutdown failed"
-                    );
+                    ),
+                    Err(_) => tracing::error!(
+                        target: "shutdown",
+                        timeout_ms = shutdown_cancel_timeout.as_millis() as u64,
+                        open_before,
+                        "cancel_all on shutdown timed out; exiting anyway"
+                    ),
                 }
                 std::process::exit(0);
             });
