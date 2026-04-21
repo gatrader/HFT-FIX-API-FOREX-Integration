@@ -4,11 +4,11 @@
 //! signer-derived maker at +0x1b8 and atomic nonce at +0x1a8,
 //! except the nonce is persisted (see nonce_store.rs).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, U256};
 use parking_lot::RwLock;
@@ -105,6 +105,11 @@ pub struct TradingClient {
     /// The map is guarded by `RwLock` because the cancel path and
     /// the submit path update it from different tasks.
     open_orders: RwLock<HashMap<String, OpenOrder>>,
+    /// Millis-since-unix-epoch of the last successful cancel (via
+    /// any of `/order`, `/orders`, `/cancel-all`, including dry-run
+    /// short-circuits). `0` means no cancel has ever completed.
+    /// Mirror of `Position::last_fill_at_ms` for the stats logger.
+    last_cancel_at_ms: AtomicU64,
 }
 
 /// Metadata for a maker order the replica has placed and still
@@ -217,6 +222,7 @@ impl TradingClient {
             fee_rate_bps,
             creds: RwLock::new(None),
             open_orders: RwLock::new(HashMap::new()),
+            last_cancel_at_ms: AtomicU64::new(0),
         })
     }
 
@@ -428,6 +434,30 @@ impl TradingClient {
         self.open_orders.read().len()
     }
 
+    /// Wall-clock ms-since-epoch of the last successful cancel on
+    /// this client. `0` means the process has never cancelled. Used
+    /// by the stats logger alongside `Position::last_fill_age_ms`.
+    pub fn last_cancel_at_ms(&self) -> u64 {
+        self.last_cancel_at_ms.load(Ordering::Relaxed)
+    }
+
+    /// Milliseconds since the last successful cancel, or `None` if
+    /// no cancel has completed. Operator-facing observability —
+    /// matches `Position::last_fill_age_ms_opt` so the two can be
+    /// logged side-by-side in one line.
+    pub fn last_cancel_age_ms_opt(&self) -> Option<u64> {
+        let s = self.last_cancel_at_ms.load(Ordering::Relaxed);
+        if s == 0 {
+            return None;
+        }
+        let now = now_ms();
+        Some(now.saturating_sub(s))
+    }
+
+    fn stamp_last_cancel(&self) {
+        self.last_cancel_at_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
     /// Record a freshly-placed order in the open-order registry.
     /// Exposed as `pub(crate)` so the runtime / worker can stage
     /// metadata on successful POST paths (including the test-only
@@ -454,6 +484,7 @@ impl TradingClient {
         if self.dry_run {
             tracing::info!(target: "dry_run_cancel", order_id, "cancel (dry_run)");
             self.forget_open_order(order_id);
+            self.stamp_last_cancel();
             return Ok(());
         }
         let body = serde_json::to_string(&CancelOneBody { order_id })
@@ -466,6 +497,11 @@ impl TradingClient {
     /// Cancel a batch of orders in one request. DELETE /orders
     /// with `{"orderIDs": [...]}`. Empty input returns Ok with no
     /// HTTP call — saves a round trip when the registry is empty.
+    ///
+    /// Duplicate ids in the input are collapsed before signing so
+    /// a caller mistake (or a future reconcile path that merges
+    /// REST state with the local registry) can't spray the same
+    /// orderID on the wire. First-seen order is preserved.
     pub async fn cancel_orders(
         &self,
         order_ids: &[String],
@@ -473,22 +509,31 @@ impl TradingClient {
         if order_ids.is_empty() {
             return Ok(());
         }
+        let mut seen: HashSet<&str> = HashSet::with_capacity(order_ids.len());
+        let deduped: Vec<&str> = order_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| seen.insert(*id))
+            .collect();
+        if deduped.is_empty() {
+            return Ok(());
+        }
         if self.dry_run {
-            for id in order_ids {
+            for id in &deduped {
                 self.forget_open_order(id);
             }
             tracing::info!(
                 target: "dry_run_cancel",
-                n = order_ids.len(),
+                n = deduped.len(),
                 "batch cancel (dry_run)"
             );
+            self.stamp_last_cancel();
             return Ok(());
         }
-        let refs: Vec<&str> = order_ids.iter().map(String::as_str).collect();
-        let body = serde_json::to_string(&CancelBatchBody { order_ids: &refs })
+        let body = serde_json::to_string(&CancelBatchBody { order_ids: &deduped })
             .map_err(|e| ClientError::Other(e.to_string()))?;
         self.send_cancel("DELETE", "/orders", &body).await?;
-        for id in order_ids {
+        for id in &deduped {
             self.forget_open_order(id);
         }
         Ok(())
@@ -502,6 +547,7 @@ impl TradingClient {
         if self.dry_run {
             self.open_orders.write().clear();
             tracing::info!(target: "dry_run_cancel", "cancel_all (dry_run)");
+            self.stamp_last_cancel();
             return Ok(());
         }
         self.send_cancel("DELETE", "/cancel-all", "").await?;
@@ -561,6 +607,7 @@ impl TradingClient {
                 format!("cancel {method} {path} {status}: {body_text}"),
             ));
         }
+        self.stamp_last_cancel();
         Ok(())
     }
 
@@ -727,6 +774,16 @@ fn decode_price_size(order: &ClobOrder) -> (f64, f64) {
     }
 }
 
+/// Wall-clock ms-since-epoch. Matches `position::now_ms` so the
+/// `last_fill_age_ms` / `last_cancel_age_ms` pair are on the same
+/// clock.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Clip a string at `limit` chars on a UTF-8 boundary so the
 /// order_reject warn never spills a multi-megabyte HTML error
 /// page into the logs. Returns the input unchanged when it fits.
@@ -814,5 +871,83 @@ mod tests {
         let out = truncate_for_log(&s, 10);
         // Must not panic and must leave a valid String.
         assert!(out.is_char_boundary(out.len()));
+    }
+
+    fn mk_registered_order(id: &str) -> OpenOrder {
+        OpenOrder {
+            order_id: id.into(),
+            token_id: "tkn".into(),
+            side: Side::Buy,
+            price: 0.5,
+            size: 10.0,
+            placed_at: Instant::now(),
+        }
+    }
+
+    fn mk_dry_client() -> (TradingClient, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key =
+            "0000000000000000000000000000000000000000000000000000000000000001";
+        let c = TradingClient::new(key, dir.path().join("nonce"), true, 0)
+            .unwrap();
+        (c, dir)
+    }
+
+    #[tokio::test]
+    async fn cancel_orders_collapses_duplicate_ids() {
+        let (c, _d) = mk_dry_client();
+        c.record_open_order(mk_registered_order("A"));
+        c.record_open_order(mk_registered_order("B"));
+        assert_eq!(c.open_order_count(), 2);
+        // Caller-side mistake: same id repeated three times plus a
+        // second distinct id. Dry-run cancel must succeed and leave
+        // the registry empty — dedup should not cause "A" to be
+        // skipped on removal.
+        let ids = vec![
+            "A".to_string(),
+            "A".to_string(),
+            "A".to_string(),
+            "B".to_string(),
+        ];
+        c.cancel_orders(&ids).await.expect("dry-run cancel ok");
+        assert_eq!(c.open_order_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_orders_empty_input_is_noop() {
+        let (c, _d) = mk_dry_client();
+        let ids: Vec<String> = Vec::new();
+        c.cancel_orders(&ids).await.expect("empty is ok");
+        assert_eq!(c.last_cancel_at_ms(), 0, "no-op must not stamp");
+    }
+
+    #[tokio::test]
+    async fn cancel_all_dry_run_stamps_last_cancel() {
+        let (c, _d) = mk_dry_client();
+        assert_eq!(c.last_cancel_at_ms(), 0);
+        assert_eq!(c.last_cancel_age_ms_opt(), None);
+        c.record_open_order(mk_registered_order("A"));
+        c.cancel_all().await.expect("dry-run cancel_all ok");
+        assert!(c.last_cancel_at_ms() > 0);
+        assert!(c.last_cancel_age_ms_opt().is_some());
+        assert_eq!(c.open_order_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_order_dry_run_stamps_last_cancel() {
+        let (c, _d) = mk_dry_client();
+        c.record_open_order(mk_registered_order("A"));
+        c.cancel_order("A").await.expect("dry-run single cancel ok");
+        assert!(c.last_cancel_at_ms() > 0);
+        assert_eq!(c.open_order_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_orders_dry_run_stamps_last_cancel() {
+        let (c, _d) = mk_dry_client();
+        c.record_open_order(mk_registered_order("A"));
+        let ids = vec!["A".to_string()];
+        c.cancel_orders(&ids).await.expect("dry-run batch ok");
+        assert!(c.last_cancel_at_ms() > 0);
     }
 }
