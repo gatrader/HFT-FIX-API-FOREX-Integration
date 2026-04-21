@@ -31,6 +31,7 @@ fn sample_order(maker: Address) -> ClobOrder {
     ClobOrder::new(
         42u64,                            // salt (u64, matches py-clob-client)
         maker,
+        maker,
         U256::from(1_000_000u64),         // tokenId
         U256::from(50_000_000u64),        // makerAmount (0.5 * 100 shares * 1e6)
         U256::from(100_000_000u64),       // takerAmount (100 shares * 1e6)
@@ -38,6 +39,7 @@ fn sample_order(maker: Address) -> ClobOrder {
         U256::from(7u64),                 // nonce
         U256::from(0u64),                 // feeRateBps
         Side::Buy,
+        0,
     )
 }
 

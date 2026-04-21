@@ -70,6 +70,7 @@ impl ClobOrder {
     pub fn new(
         salt: u64,
         maker: Address,
+        signer: Address,
         token_id: U256,
         maker_amount: U256,
         taker_amount: U256,
@@ -77,11 +78,12 @@ impl ClobOrder {
         nonce: U256,
         fee_rate_bps: U256,
         side: Side,
+        signature_type: u8,
     ) -> Self {
         Self {
             salt,
             maker,
-            signer: maker,
+            signer,
             taker: Address::ZERO,
             token_id: token_id.to_string(),
             maker_amount: maker_amount.to_string(),
@@ -93,7 +95,7 @@ impl ClobOrder {
                 Side::Buy => "BUY".into(),
                 Side::Sell => "SELL".into(),
             },
-            signature_type: 0,
+            signature_type,
         }
     }
 

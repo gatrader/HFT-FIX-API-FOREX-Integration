@@ -67,7 +67,9 @@ struct OrderEnvelope<'a> {
 pub struct TradingClient {
     signer: Eip712Signer,
     raw_signer: alloy_signer_local::PrivateKeySigner,
-    maker: Address,
+    signer_address: Address,
+    funder: Address,
+    signature_type: u8,
     /// TRACING-ONLY request counter. NOT a trading nonce and NOT
     /// sent on the wire. The EIP-712 `order.nonce` field is pinned
     /// to 0 (CTF Exchange cancel nonce); this counter exists solely
@@ -150,7 +152,40 @@ impl TradingClient {
         dry_run: bool,
         fee_rate_bps: u32,
     ) -> anyhow::Result<Self> {
-        Self::with_base_url(hex_key, nonce_path, dry_run, fee_rate_bps, CLOB_BASE)
+        Self::with_base_url(
+            hex_key,
+            nonce_path,
+            dry_run,
+            fee_rate_bps,
+            0,
+            None,
+            CLOB_BASE,
+        )
+    }
+
+    /// Constructor that accepts an explicit Polymarket wallet mode.
+    ///
+    /// `signature_type=0` is the standalone EOA path. Proxy-wallet
+    /// users (`1` / `2`) keep the same signing key for L1 auth and
+    /// EIP-712 order signatures, but set `funder` to the proxy wallet
+    /// that actually holds funds and positions on Polymarket.com.
+    pub fn new_with_wallet(
+        hex_key: &str,
+        nonce_path: PathBuf,
+        dry_run: bool,
+        fee_rate_bps: u32,
+        signature_type: u8,
+        funder: Option<Address>,
+    ) -> anyhow::Result<Self> {
+        Self::with_base_url(
+            hex_key,
+            nonce_path,
+            dry_run,
+            fee_rate_bps,
+            signature_type,
+            funder,
+            CLOB_BASE,
+        )
     }
 
     /// Constructor that lets callers override the CLOB base URL.
@@ -161,12 +196,15 @@ impl TradingClient {
         nonce_path: PathBuf,
         dry_run: bool,
         fee_rate_bps: u32,
+        signature_type: u8,
+        funder: Option<Address>,
         base_url: &str,
     ) -> anyhow::Result<Self> {
         let signer = Eip712Signer::from_hex(hex_key)?;
         let raw_signer: alloy_signer_local::PrivateKeySigner =
             hex_key.parse()?;
-        let maker = signer.maker();
+        let signer_address = signer.maker();
+        let funder = funder.unwrap_or(signer_address);
         let nonce_store = NonceStore::open(nonce_path)?;
         let nonce = Arc::new(AtomicU64::new(nonce_store.load()));
         // Safe, conservative HTTP tuning:
@@ -199,7 +237,9 @@ impl TradingClient {
         Ok(Self {
             signer,
             raw_signer,
-            maker,
+            signer_address,
+            funder,
+            signature_type,
             nonce,
             _nonce_store: nonce_store,
             http,
@@ -247,7 +287,19 @@ impl TradingClient {
     }
 
     pub fn maker(&self) -> Address {
-        self.maker
+        self.funder
+    }
+
+    pub fn signer_address(&self) -> Address {
+        self.signer_address
+    }
+
+    pub fn funder_address(&self) -> Address {
+        self.funder
+    }
+
+    pub fn signature_type(&self) -> u8 {
+        self.signature_type
     }
 
     pub fn book_cache(&self) -> Arc<RwLock<BookSnapshot>> {
@@ -309,7 +361,7 @@ impl TradingClient {
         let url = Url::parse(
             "https://data-api.polymarket.com/positions",
         )?;
-        let maker_lc = format!("{:#x}", self.maker);
+        let maker_lc = format!("{:#x}", self.funder);
         let resp = self
             .http
             .get(url)
@@ -385,7 +437,8 @@ impl TradingClient {
         let request_id = self.next_request_id();
         let order = ClobOrder::new(
             Self::fresh_salt(),
-            self.maker,
+            self.funder,
+            self.signer_address,
             token_id,
             maker_amount,
             taker_amount,
@@ -393,6 +446,7 @@ impl TradingClient {
             U256::ZERO, // order.nonce: CTF cancel nonce, not request counter
             U256::from(self.fee_rate_bps),
             side,
+            self.signature_type,
         );
         let t_sign = Instant::now();
         let sig = self
@@ -533,7 +587,7 @@ impl TradingClient {
         // root with a trailing slash, so strip any leading slash.
         let url = self.base_url.join(path.trim_start_matches('/'))?;
         let headers = l2_headers(
-            self.maker, &creds, Self::now_ts(), method, path, body,
+            self.signer_address, &creds, Self::now_ts(), method, path, body,
         )
         .map_err(|e| ClientError::Other(e.to_string()))?;
         let mut req = self
@@ -597,7 +651,7 @@ impl TradingClient {
             .map_err(|e| ClientError::Other(e.to_string()))?;
         tracing::info!(target: "order_body", "{body}");
         let headers = l2_headers(
-            self.maker,
+            self.signer_address,
             &creds,
             Self::now_ts(),
             "POST",
@@ -833,6 +887,29 @@ mod tests {
         let ids: Vec<String> = Vec::new();
         let body = encode_cancel_orders_body(&ids).expect("body serializes");
         assert_eq!(body, "[]");
+    }
+
+    #[test]
+    fn proxy_wallet_order_uses_funder_as_maker_and_signer_as_signer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proxy: Address = "0x31d39de926465dc288948846efc44bfe64914399"
+            .parse()
+            .expect("proxy parses");
+        let client = TradingClient::new_with_wallet(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            dir.path().join("nonce"),
+            true,
+            0,
+            2,
+            Some(proxy),
+        )
+        .expect("client");
+        let prepared = client
+            .sign_for_submit(U256::from(7), U256::from(11), U256::from(13), Side::Buy)
+            .expect("prepared");
+        assert_eq!(prepared.signed.order.maker, proxy);
+        assert_eq!(prepared.signed.order.signer, client.signer_address());
+        assert_eq!(prepared.signed.order.signature_type, 2);
     }
 
 }

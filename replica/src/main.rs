@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -41,6 +41,16 @@ struct Cli {
     /// Path to the cached API credentials.
     #[arg(long, default_value = "./.replica/creds.json")]
     creds: PathBuf,
+
+    /// Polymarket signature type: 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE.
+    #[arg(long, env = "POLYMARKET_SIGNATURE_TYPE", default_value_t = 0)]
+    signature_type: u8,
+
+    /// Optional Polymarket funder/proxy wallet. Required for signature
+    /// types 1 and 2 so posted orders settle against the wallet shown in
+    /// the Polymarket UI instead of the raw signer EOA.
+    #[arg(long, env = "POLYMARKET_FUNDER")]
+    funder: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -203,6 +213,7 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    let wallet_mode = parse_wallet_mode(&cli)?;
     if let Some(parent) = cli.nonce.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -212,8 +223,15 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Bootstrap => {
-            let client = TradingClient::new(&cli.key, cli.nonce, true, 0)?;
-            tracing::info!(maker = %client.maker(), "bootstrapping");
+            let client = TradingClient::new_with_wallet(
+                &cli.key,
+                cli.nonce,
+                true,
+                0,
+                wallet_mode.signature_type,
+                wallet_mode.funder,
+            )?;
+            log_wallet_mode(&client, "bootstrapping");
             let creds = client.bootstrap().await?;
             std::fs::write(&cli.creds, serde_json::to_string_pretty(&creds)?)
                 .with_context(|| format!("writing {:?}", cli.creds))?;
@@ -223,8 +241,15 @@ async fn main() -> Result<()> {
 
         Cmd::Dryrun { config, token_id, net_position } => {
             let (cfg, token) = load_config(&config, &token_id)?;
-            let client = TradingClient::new(&cli.key, cli.nonce, true,
-                                            0)?;
+            let client = TradingClient::new_with_wallet(
+                &cli.key,
+                cli.nonce,
+                true,
+                0,
+                wallet_mode.signature_type,
+                wallet_mode.funder,
+            )?;
+            log_wallet_mode(&client, "dryrun configured");
             load_creds_into(&cli.creds, &client)?;
             run_one(&cfg, &client, token, net_position).await
         }
@@ -239,9 +264,15 @@ async fn main() -> Result<()> {
                     "canary refuses to run with dry_run=true — flip to false first"
                 );
             }
-            let client = TradingClient::new(
-                &cli.key, cli.nonce, false, fee_rate_bps,
+            let client = TradingClient::new_with_wallet(
+                &cli.key,
+                cli.nonce,
+                false,
+                fee_rate_bps,
+                wallet_mode.signature_type,
+                wallet_mode.funder,
             )?;
+            log_wallet_mode(&client, "canary configured");
             load_creds_into(&cli.creds, &client)?;
             // Single TradingClient = single reqwest::Client = shared
             // HTTP keepalive pool across all iterations. That's what
@@ -287,9 +318,15 @@ async fn main() -> Result<()> {
             let (cfg, token) = load_config(&config, &token_id)?;
             // Arc<TradingClient>: shared between runtime tick (sign)
             // and submit worker (HTTP). Cheap clone.
-            let client = Arc::new(TradingClient::new(
-                &cli.key, cli.nonce, cfg.dry_run, fee_rate_bps,
+            let client = Arc::new(TradingClient::new_with_wallet(
+                &cli.key,
+                cli.nonce,
+                cfg.dry_run,
+                fee_rate_bps,
+                wallet_mode.signature_type,
+                wallet_mode.funder,
             )?);
+            log_wallet_mode(&client, "runtime configured");
             if cfg.dry_run {
                 tracing::warn!(
                     target: "runtime",
@@ -580,6 +617,49 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WalletMode {
+    signature_type: u8,
+    funder: Option<Address>,
+}
+
+fn parse_wallet_mode(cli: &Cli) -> Result<WalletMode> {
+    if cli.signature_type > 2 {
+        anyhow::bail!(
+            "--signature-type must be 0 (EOA), 1 (POLY_PROXY), or 2 (GNOSIS_SAFE)"
+        );
+    }
+    let funder = cli
+        .funder
+        .as_deref()
+        .map(|s| {
+            s.parse::<Address>().with_context(|| {
+                format!("parsing --funder / POLYMARKET_FUNDER address: {s}")
+            })
+        })
+        .transpose()?;
+    if cli.signature_type != 0 && funder.is_none() {
+        anyhow::bail!(
+            "signature type {} requires --funder / POLYMARKET_FUNDER to be set to your Polymarket proxy wallet",
+            cli.signature_type
+        );
+    }
+    Ok(WalletMode {
+        signature_type: cli.signature_type,
+        funder,
+    })
+}
+
+fn log_wallet_mode(client: &TradingClient, message: &'static str) {
+    tracing::info!(
+        target: "wallet",
+        signer = %client.signer_address(),
+        funder = %client.funder_address(),
+        signature_type = client.signature_type(),
+        "{message}"
+    );
 }
 
 fn load_config(path: &PathBuf, token_id: &str) -> Result<(BotConfig, U256)> {

@@ -172,6 +172,8 @@ async fn run_arm(queued: bool, sleep_ms: u64, duration_ms: u64) -> ArmResult {
             tmp.path().join("nonce"),
             /* dry_run */ false,
             0,
+            0,
+            None,
             &mock.url,
         )
         .expect("TradingClient"),

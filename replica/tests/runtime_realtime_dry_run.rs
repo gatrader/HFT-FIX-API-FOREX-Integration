@@ -57,6 +57,7 @@ async fn sign_us_microbench() {
         ClobOrder::new(
             salt,
             maker,
+            maker,
             U256::from(42u64),
             U256::from(1_000_000_u64),
             U256::from(500_000_u64),
@@ -64,6 +65,7 @@ async fn sign_us_microbench() {
             U256::ZERO,
             U256::from(0u64),
             Side::Sell,
+            0,
         )
     };
 

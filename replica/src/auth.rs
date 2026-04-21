@@ -102,7 +102,7 @@ pub fn l2_signature(
 
 /// Build the full L2 header set for a CLOB request.
 pub fn l2_headers(
-    maker: Address,
+    signer_address: Address,
     creds: &ApiCredentials,
     timestamp_secs: i64,
     method: &str,
@@ -111,7 +111,7 @@ pub fn l2_headers(
 ) -> anyhow::Result<Vec<(&'static str, String)>> {
     let sig = l2_signature(&creds.secret, timestamp_secs, method, path, body)?;
     Ok(vec![
-        ("POLY_ADDRESS", format!("{:#x}", maker)),
+        ("POLY_ADDRESS", format!("{:#x}", signer_address)),
         ("POLY_API_KEY", creds.api_key.clone()),
         ("POLY_PASSPHRASE", creds.passphrase.clone()),
         ("POLY_TIMESTAMP", timestamp_secs.to_string()),
