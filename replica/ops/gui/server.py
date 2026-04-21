@@ -292,6 +292,8 @@ def _static(h: BaseHTTPRequestHandler, rel: str) -> None:
         ".js":   "application/javascript; charset=utf-8",
         ".css":  "text/css; charset=utf-8",
         ".svg":  "image/svg+xml",
+        ".png":  "image/png",
+        ".ico":  "image/x-icon",
     }.get(ext, "application/octet-stream")
     body = safe.read_bytes()
     h.send_response(200)
