@@ -35,7 +35,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use tokio::sync::mpsc;
 
 use crate::book::BookSnapshot;
-use crate::client::{PreparedSubmit, TradingClient};
+use crate::client::{OpenOrder, PreparedSubmit, TradingClient};
 use crate::order::Side;
 use crate::position::Position;
 use crate::state_machine::{Decision, SpreadCapture, Tick};
@@ -230,6 +230,37 @@ pub enum SuppressReason {
     Duplicate,
     /// Submit budget exhausted for the current rolling second.
     Budget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenOrderDisposition {
+    None,
+    Hold,
+    Cancel,
+}
+
+fn classify_open_orders(
+    open_orders: &[OpenOrder],
+    side: Side,
+    price: f64,
+    size: f64,
+    price_step: f64,
+    size_step: f64,
+) -> OpenOrderDisposition {
+    if open_orders.is_empty() {
+        return OpenOrderDisposition::None;
+    }
+    let pb = price_bucket(price, price_step);
+    let sb = size_bucket(size, size_step);
+    if open_orders.iter().any(|order| {
+        order.side == side
+            && price_bucket(order.price, price_step) == pb
+            && size_bucket(order.size, size_step) == sb
+    }) {
+        OpenOrderDisposition::Hold
+    } else {
+        OpenOrderDisposition::Cancel
+    }
 }
 
 /// Bucket a price into a u64 key for dedup. Scales by `1/step`
@@ -683,6 +714,40 @@ impl Runtime {
             Decision::Skip => return Ok(()),
         };
 
+        match classify_open_orders(
+            &client.open_orders_snapshot(),
+            side,
+            price,
+            size,
+            self.cfg.price_bucket,
+            self.cfg.size_bucket,
+        ) {
+            OpenOrderDisposition::None => {}
+            OpenOrderDisposition::Hold => {
+                tracing::debug!(
+                    target: "open_orders",
+                    open_count = client.open_order_count(),
+                    ?side,
+                    price,
+                    size,
+                    "matching open order already live; skipping emit"
+                );
+                return Ok(());
+            }
+            OpenOrderDisposition::Cancel => {
+                tracing::debug!(
+                    target: "open_orders",
+                    open_count = client.open_order_count(),
+                    ?side,
+                    price,
+                    size,
+                    "stale open order present; enqueue cancel instead of stacking"
+                );
+                self.enqueue_cancel_if_needed();
+                return Ok(());
+            }
+        }
+
         let now = Instant::now();
         match self.decide_emit(side, price, size, now) {
             EmitDecision::Suppressed(_) => return Ok(()),
@@ -895,6 +960,38 @@ mod tests {
         assert_eq!(
             rt.decide_emit(Side::Buy, 0.52, 10.0, t2),
             EmitDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn classify_open_orders_holds_matching_bucket() {
+        let orders = vec![OpenOrder {
+            order_id: "o-1".into(),
+            token_id: "t-1".into(),
+            side: Side::Buy,
+            price: 0.58,
+            size: 5.0,
+            placed_at: Instant::now(),
+        }];
+        assert_eq!(
+            classify_open_orders(&orders, Side::Buy, 0.581, 5.0, 0.01, 1.0),
+            OpenOrderDisposition::Hold
+        );
+    }
+
+    #[test]
+    fn classify_open_orders_cancels_stale_bucket() {
+        let orders = vec![OpenOrder {
+            order_id: "o-1".into(),
+            token_id: "t-1".into(),
+            side: Side::Buy,
+            price: 0.58,
+            size: 5.0,
+            placed_at: Instant::now(),
+        }];
+        assert_eq!(
+            classify_open_orders(&orders, Side::Buy, 0.59, 5.0, 0.01, 1.0),
+            OpenOrderDisposition::Cancel
         );
     }
 

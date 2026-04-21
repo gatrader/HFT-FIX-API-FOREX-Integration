@@ -25,6 +25,12 @@ use crate::client::TradingClient;
 use crate::config::SpreadConfig;
 use crate::order::{pick_side, Side};
 
+const VENUE_TICK_SIZE: f64 = 0.001;
+
+fn quantize_price(price: f64) -> f64 {
+    ((price / VENUE_TICK_SIZE).round() as i64) as f64 * VENUE_TICK_SIZE
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Init,
@@ -121,14 +127,14 @@ impl SpreadCapture {
         // identifies surplus (§33 / FINAL_AUDIT §8).
         self.spread_cfg.decay(surplus);
 
-        let price = match side {
+        let price = quantize_price(match side {
             Side::Buy => self
                 .min_price
                 .max(tick.book.best_bid().unwrap_or(self.min_price)),
             Side::Sell => self
                 .max_price
                 .min(tick.book.best_ask().unwrap_or(self.max_price)),
-        };
+        });
         let size = self.spread_cfg.order_size;
         let (maker_amount, taker_amount) = encode_amounts(side, price, size);
 
@@ -216,8 +222,8 @@ pub enum Decision {
 /// SELL: maker_amount = shares, taker_amount = price * shares
 pub fn encode_amounts(side: Side, price: f64, size: f64) -> (U256, U256) {
     let scale = 1_000_000.0;
-    let shares = (size * scale) as u128;
-    let notional = (price * size * scale) as u128;
+    let shares = (size * scale).round() as u128;
+    let notional = (price * size * scale).round() as u128;
     match side {
         Side::Buy => (U256::from(notional), U256::from(shares)),
         Side::Sell => (U256::from(shares), U256::from(notional)),
@@ -240,5 +246,18 @@ mod tests {
         let (m, t) = encode_amounts(Side::Sell, 0.50, 100.0);
         assert_eq!(m, U256::from(100_000_000u128));
         assert_eq!(t, U256::from(50_000_000u128));
+    }
+
+    #[test]
+    fn quantize_price_snaps_to_venue_tick() {
+        assert!((quantize_price(0.5819998) - 0.582).abs() < 1e-9);
+        assert!((quantize_price(0.5804) - 0.58).abs() < 1e-9);
+    }
+
+    #[test]
+    fn encode_amounts_rounds_scaled_notional() {
+        let (m, t) = encode_amounts(Side::Buy, 0.582, 5.0);
+        assert_eq!(m, U256::from(2_910_000u128));
+        assert_eq!(t, U256::from(5_000_000u128));
     }
 }

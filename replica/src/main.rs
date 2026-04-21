@@ -285,13 +285,15 @@ async fn main() -> Result<()> {
             use std::time::Duration;
 
             let (cfg, token) = load_config(&config, &token_id)?;
+            // Arc<TradingClient>: shared between runtime tick (sign)
+            // and submit worker (HTTP). Cheap clone.
             let client = Arc::new(TradingClient::new(
                 &cli.key, cli.nonce, cfg.dry_run, fee_rate_bps,
             )?);
             if cfg.dry_run {
                 tracing::warn!(
                     target: "runtime",
-                    "running runtime in dry_run mode — decisions will be signed and logged, not posted"
+                    "running runtime in dry_run mode ? decisions will be signed and logged, not posted"
                 );
             }
             load_creds_into(&cli.creds, &client)?;
@@ -312,6 +314,8 @@ async fn main() -> Result<()> {
             let stats = Arc::new(RuntimeStats::default());
 
             let mut rt: Runtime;
+            // Hoisted so the 1 Hz stats logger below can read
+            // ws_fallback_to_rest_count into the runtime_tick event.
             #[cfg(feature = "ws")]
             let mut ws_stats_for_log: Option<Arc<arbigab_replica::ws::WsStats>> = None;
             #[cfg(feature = "ws")]
@@ -341,6 +345,11 @@ async fn main() -> Result<()> {
                 }
                 rt = Runtime::new(rt_cfg, sm, book.clone(), stats.clone());
             }
+            // Seed in priority order: --net-position first (the
+            // user-facing default), then overwrite with reconcile
+            // result if enabled and successful. Fills landing
+            // during startup get applied on top of whichever seed
+            // won — that's inherent to an unordered reconcile.
             rt.set_net_position(net_position);
             if reconcile_on_start {
                 match client.fetch_position_shares(&token_id).await {
@@ -364,6 +373,10 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // ── Fill ingestion (user WS channel) ──────────────────
+            // Spawns an authenticated WS subscriber that applies
+            // fills to the shared Position handle. Disabled by
+            // default so dry-run and benchmark paths stay hermetic.
             #[cfg(feature = "ws")]
             if user_ws {
                 if market.is_empty() {
@@ -396,6 +409,9 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // ── Submit decoupling (PR 4) ──────────────────────────
+            // Default: bounded mpsc + worker. Rollback: --inline-submit
+            // restores the PR 3 behavior of awaiting HTTP on the tick.
             if !inline_submit {
                 let (tx, rx) = tokio::sync::mpsc::channel(submit_queue_capacity);
                 let worker = SubmitWorker::new(
@@ -415,6 +431,10 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // ── Cancel worker (B) ─────────────────────────────────
+            // Always wired. The dedup window inside Runtime keeps
+            // the rate sane, and Cancel* decisions are the state
+            // machine's only self-throttle.
             let (ctx, crx) = tokio::sync::mpsc::channel(cancel_queue_capacity);
             let cancel_worker = CancelWorker::new(
                 client.clone(), crx, stats.clone(),
@@ -422,6 +442,11 @@ async fn main() -> Result<()> {
             tokio::spawn(cancel_worker.run());
             rt = rt.with_cancel_queue(ctx);
 
+            // ── Startup cancel-all ─────────────────────────────────
+            // Honors BotConfig.cancel_orders_on_start and the
+            // `--force-cancel-on-start` CLI override. Fires before
+            // the first tick so the unwinder starts from a known
+            // "no resting orders" state.
             if cfg.cancel_orders_on_start || force_cancel_on_start {
                 match client.cancel_all().await {
                     Ok(()) => tracing::info!(
@@ -435,6 +460,11 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // ── SIGINT → cancel-all → exit ────────────────────────
+            // Signal handler runs outside tokio::select! below so
+            // Ctrl-C at any point flushes open orders before the
+            // process exits. Cloned client so the handler task
+            // owns its own reference.
             let shutdown_client = client.clone();
             tokio::spawn(async move {
                 if let Err(e) = tokio::signal::ctrl_c().await {
@@ -457,6 +487,8 @@ async fn main() -> Result<()> {
                 std::process::exit(0);
             });
 
+            // 1 Hz stats logger — independent cadence from the
+            // decision tick so the log isn't N×/sec at 150ms ticks.
             let stats_for_log = stats.clone();
             let book_for_log = book.clone();
             #[cfg(feature = "ws")]
@@ -523,6 +555,8 @@ async fn main() -> Result<()> {
             let client = WsClient::new(
                 vec![token_id.clone()], cache.clone(), stats.clone(),
             );
+            // Drive the reconnect loop on a detached task so we can
+            // print stats on our cadence.
             tokio::spawn(async move { let _ = client.run().await; });
 
             for _ in 0..seconds {
