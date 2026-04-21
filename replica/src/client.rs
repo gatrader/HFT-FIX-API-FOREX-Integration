@@ -143,13 +143,6 @@ struct CancelOneBody<'a> {
     order_id: &'a str,
 }
 
-/// Body shape for DELETE /orders (batch cancel).
-#[derive(Serialize)]
-struct CancelBatchBody<'a> {
-    #[serde(rename = "orderIDs")]
-    order_ids: &'a [&'a str],
-}
-
 impl TradingClient {
     pub fn new(
         hex_key: &str,
@@ -421,6 +414,13 @@ impl TradingClient {
         self.open_orders.read().keys().cloned().collect()
     }
 
+    /// Snapshot of the currently-open order metadata. The runtime
+    /// uses this to avoid stacking multiple live orders when one
+    /// resting quote already satisfies the current bucket.
+    pub fn open_orders_snapshot(&self) -> Vec<OpenOrder> {
+        self.open_orders.read().values().cloned().collect()
+    }
+
     /// Number of orders the registry believes are live. Useful as
     /// a dedup input for the runtime's cancel-trigger path (don't
     /// emit a cancel request when there's nothing to cancel).
@@ -484,9 +484,7 @@ impl TradingClient {
             );
             return Ok(());
         }
-        let refs: Vec<&str> = order_ids.iter().map(String::as_str).collect();
-        let body = serde_json::to_string(&CancelBatchBody { order_ids: &refs })
-            .map_err(|e| ClientError::Other(e.to_string()))?;
+        let body = encode_cancel_orders_body(order_ids)?;
         self.send_cancel("DELETE", "/orders", &body).await?;
         for id in order_ids {
             self.forget_open_order(id);
@@ -727,6 +725,13 @@ fn decode_price_size(order: &ClobOrder) -> (f64, f64) {
     }
 }
 
+/// Encode Polymarket's batch-cancel request body. DELETE /orders
+/// expects a raw JSON array of order IDs, and the signed body must
+/// match that exact wire representation.
+fn encode_cancel_orders_body(order_ids: &[String]) -> Result<String, ClientError> {
+    serde_json::to_string(order_ids).map_err(|e| ClientError::Other(e.to_string()))
+}
+
 /// Clip a string at `limit` chars on a UTF-8 boundary so the
 /// order_reject warn never spills a multi-megabyte HTML error
 /// page into the logs. Returns the input unchanged when it fits.
@@ -815,4 +820,19 @@ mod tests {
         // Must not panic and must leave a valid String.
         assert!(out.is_char_boundary(out.len()));
     }
+
+    #[test]
+    fn cancel_batch_body_is_raw_json_array() {
+        let ids = vec!["0xabc".to_string(), "0xdef".to_string()];
+        let body = encode_cancel_orders_body(&ids).expect("body serializes");
+        assert_eq!(body, r#"["0xabc","0xdef"]"#);
+    }
+
+    #[test]
+    fn cancel_batch_body_empty_array() {
+        let ids: Vec<String> = Vec::new();
+        let body = encode_cancel_orders_body(&ids).expect("body serializes");
+        assert_eq!(body, "[]");
+    }
+
 }

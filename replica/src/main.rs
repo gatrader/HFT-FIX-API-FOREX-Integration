@@ -285,14 +285,17 @@ async fn main() -> Result<()> {
             use std::time::Duration;
 
             let (cfg, token) = load_config(&config, &token_id)?;
-            if cfg.dry_run {
-                anyhow::bail!("runtime refuses to run with dry_run=true");
-            }
             // Arc<TradingClient>: shared between runtime tick (sign)
             // and submit worker (HTTP). Cheap clone.
             let client = Arc::new(TradingClient::new(
-                &cli.key, cli.nonce, false, fee_rate_bps,
+                &cli.key, cli.nonce, cfg.dry_run, fee_rate_bps,
             )?);
+            if cfg.dry_run {
+                tracing::warn!(
+                    target: "runtime",
+                    "running runtime in dry_run mode ? decisions will be signed and logged, not posted"
+                );
+            }
             load_creds_into(&cli.creds, &client)?;
 
             let rt_cfg = RuntimeConfig {
