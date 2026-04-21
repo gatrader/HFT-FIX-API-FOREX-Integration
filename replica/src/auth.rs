@@ -151,6 +151,33 @@ pub async fn bootstrap_credentials(
     Ok(creds)
 }
 
+/// GET /auth/derive-api-key — returns the credentials already
+/// registered for this EOA. Same L1 signature as bootstrap; the
+/// server looks up existing keys instead of minting new ones.
+/// Use this when /auth/api-key returns 400 "Could not create api
+/// key" because the wallet has been bootstrapped previously.
+pub async fn derive_credentials(
+    http: &reqwest::Client,
+    signer: &PrivateKeySigner,
+) -> anyhow::Result<ApiCredentials> {
+    let ts = chrono::Utc::now().timestamp();
+    let headers = l1_headers(signer, ts, 0)?;
+    let url = format!("{CLOB_API_HOST}/auth/derive-api-key");
+    let mut req = http.get(&url);
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("/auth/derive-api-key {status}: {body}"));
+    }
+    let creds: ApiCredentials = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("parse credentials: {e}; body={body}"))?;
+    Ok(creds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
