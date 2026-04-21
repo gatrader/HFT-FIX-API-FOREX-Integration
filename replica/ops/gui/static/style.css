@@ -242,3 +242,97 @@ footer {
   font-family: var(--font-mono);
   font-size: 11px;
 }
+
+/* Run-state pill in the header. Renders next to the mode badge so
+   the operator sees at a glance whether a job is still active. */
+.pill {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+}
+.pill.idle    { color: var(--text-secondary); border-color: var(--border); }
+.pill.running {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(34, 197, 94, 0.10);
+  animation: pulse 1.8s ease-in-out infinite;
+}
+.pill.stopping {
+  color: var(--warning);
+  border-color: var(--warning);
+  background: rgba(234, 179, 8, 0.10);
+}
+.pill.exited  { color: var(--text-secondary); border-color: var(--border); }
+.pill.failed  { color: var(--danger); border-color: var(--danger); background: rgba(239, 68, 68, 0.08); }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
+/* Two-column layout for the log pane + jobs sidebar. Collapses to a
+   single column on narrow widths so the log remains the focus. */
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 320px);
+  gap: 16px;
+}
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; }
+}
+
+.jobs {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px 14px;
+  max-height: 70vh;
+  overflow: auto;
+}
+.jobs-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.9px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.jobs-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.job-item {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  cursor: pointer;
+  background: var(--background);
+  transition: background-color 0.12s ease, border-color 0.12s ease;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.job-item:hover    { background: var(--surface-hover); border-color: var(--accent-dim); }
+.job-item.selected { border-color: var(--accent); background: var(--surface-hover); }
+.job-item .row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.job-item .slug     { color: var(--text-primary); font-weight: 600; }
+.job-item .state    { font-size: 10px; text-transform: uppercase; letter-spacing: 0.7px; }
+.job-item .state.running  { color: var(--accent); }
+.job-item .state.stopping { color: var(--warning); }
+.job-item .state.exited   { color: var(--text-secondary); }
+.job-item .state.failed   { color: var(--danger); }
+.job-item .ts       { color: var(--text-secondary); font-size: 10px; margin-top: 2px; }

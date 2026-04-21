@@ -3,19 +3,30 @@
 A zero-dependency Python 3 stdlib web GUI that wraps the four validated
 `replica-*.sh` operator scripts. The CLI workflow is unchanged — this
 just gives you a single pane over the same scripts + log markers you
-already grep for.
+already grep for. Palette, logo, and typography match the original
+`bot/web` (Arbigab) dashboard so the visual language carries over.
 
 ## what it shows
 
-- **Header:** host, branch / commit, current mode, server clock.
+- **Header:** Arbigab logo, host, branch / commit, current mode pill,
+  run-state pill (`idle` / `running` / `stopping` / `exited` / `failed`),
+  server clock.
 - **Status cards:** user-WS connected, last `submit complete`, last
   `fill applied`, last `order_reject`, last `startup cancel_all ok`,
   last `duration reached`.
-- **Actions:** buttons for paper, live 5m, user-ws 30s, cleanup — each
-  exec's the matching `replica-*.sh` on disk; buttons disable when a
-  script isn't present.
-- **Log viewer:** tails the current job's log file, optional filters
-  for the five known marker strings.
+- **Actions:** paper, live 5m, user-ws 30s, cleanup — each exec's the
+  matching `replica-*.sh` on disk. Destructive actions (live, cleanup)
+  prompt for confirmation. A **stop** button signals the running
+  job's process group with SIGTERM, escalating to SIGKILL after 5s.
+- **Log viewer:** tails the current (or selected) job's log file,
+  optional filters for the five known marker strings.
+- **Recent jobs sidebar:** last 8 jobs with slug / state / timestamps.
+  Click a row to pin the log viewer to that job; click again to go
+  back to following the current job.
+
+Launch buttons auto-disable while a job is running (operator should
+stop or wait before launching another). The stop button only enables
+while the current job is live.
 
 ## running it
 
@@ -71,12 +82,15 @@ operator-supplied command string.
 
 ## endpoints
 
-- `GET  /`              → dashboard
-- `GET  /api/status`    → JSON (mode, git, markers, current job)
-- `GET  /api/jobs`      → JSON (up to 32 most recent jobs)
+- `GET  /`                              → dashboard
+- `GET  /api/status`                    → JSON (mode, running, git,
+  markers, current job, recent_jobs)
+- `GET  /api/jobs`                      → JSON (up to 32 most recent jobs)
 - `GET  /api/logs?filter=…&job_id=…&limit=…` → tail of job log
-- `POST /api/run/<slug>` → launch script, return job record
-- `GET  /healthz`       → `{ ok: true }`
+- `POST /api/run/<slug>`                → launch script, return job record
+- `POST /api/stop/<job_id>`             → SIGTERM the job's process group
+  (auto-escalates to SIGKILL after 5s)
+- `GET  /healthz`                       → `{ ok: true }`
 
 ## log file layout
 
@@ -84,12 +98,23 @@ Each run writes to `$GUI_LOG_DIR/<slug>-YYYYmmddTHHMMSSZ.log`, stdout
 and stderr merged. The GUI reads these — nothing else depends on them,
 so they can be pruned at will.
 
+## tests
+
+An end-to-end smoke test spins up the real server against a tempdir
+of fake whitelisted scripts and exercises every route the frontend
+depends on, including the SIGTERM stop path:
+
+```bash
+python3 replica/ops/gui/tests/smoke.py
+```
+
+Exits 0 on success; prints `ok`/`FAIL` per check.
+
 ## what's still missing (known non-goals)
 
 - no auth; intended behind SSH tunnel for a single operator.
-- no job stop button; kill via `pkill` or wait out the duration.
-- no historical chart of fills / rejects — the log pane is source
-  of truth.
+- no historical chart of fills / rejects — the log pane + recent-jobs
+  sidebar are source of truth.
 - branch / commit are read-only; switching branches is still a
   shell thing.
 - does not parse structured JSON tracing output; pure substring

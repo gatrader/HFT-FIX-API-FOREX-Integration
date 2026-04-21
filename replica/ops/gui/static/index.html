@@ -18,6 +18,7 @@
       <span id="branch">branch —</span>
       <span id="commit">commit —</span>
       <span id="mode" class="mode">mode —</span>
+      <span id="run-state" class="pill idle">idle</span>
       <span id="server-time" class="muted">—</span>
     </div>
   </header>
@@ -54,19 +55,30 @@
     <section class="actions">
       <div class="action-header">actions</div>
       <button data-slug="paper"     class="btn">paper run</button>
-      <button data-slug="live5m"    class="btn live">live 5m</button>
+      <button data-slug="live5m"    class="btn live" data-confirm="Launch live 5-minute run? Real orders will be placed.">live 5m</button>
       <button data-slug="userws30s" class="btn">user-ws 30s</button>
-      <button data-slug="cleanup"   class="btn warn">cleanup</button>
+      <button data-slug="cleanup"   class="btn warn" data-confirm="Run cleanup? This cancels all open orders on the venue.">cleanup</button>
+      <button id="stop-btn" class="btn warn" data-confirm="Stop the running job?" disabled>stop</button>
       <span id="action-status" class="muted"></span>
     </section>
 
-    <section class="logs">
-      <div class="log-header">
-        <span>log viewer</span>
-        <span class="muted" id="log-path">—</span>
-      </div>
-      <div class="filters" id="filters"></div>
-      <pre id="log" class="log-pane">(waiting for a job)</pre>
+    <section class="layout">
+      <section class="logs">
+        <div class="log-header">
+          <span>log viewer</span>
+          <span class="muted" id="log-path">—</span>
+        </div>
+        <div class="filters" id="filters"></div>
+        <pre id="log" class="log-pane">(waiting for a job)</pre>
+      </section>
+
+      <aside class="jobs">
+        <div class="jobs-header">
+          <span>recent jobs</span>
+          <span class="muted" id="jobs-count">0</span>
+        </div>
+        <ul id="jobs-list" class="jobs-list"></ul>
+      </aside>
     </section>
   </main>
 

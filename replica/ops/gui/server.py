@@ -23,10 +23,10 @@ Env knobs (all optional):
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
-import shutil
 import signal
 import socket
 import subprocess
@@ -90,16 +90,18 @@ _jobs: list[dict] = []  # newest last
 _MAX_JOBS = 32
 
 
-def _register_job(slug: str, mode: str, log_path: Path, pid: int) -> dict:
+def _register_job(slug: str, mode: str, log_path: Path, pid: int, pgid: int) -> dict:
     job = {
         "id": f"{slug}-{int(time.time())}-{pid}",
         "slug": slug,
         "mode": mode,
         "pid": pid,
+        "pgid": pgid,
         "log_path": str(log_path),
         "started_at": datetime.utcnow().isoformat() + "Z",
         "ended_at": None,
         "exit_code": None,
+        "stop_requested_at": None,
     }
     with _jobs_lock:
         _jobs.append(job)
@@ -114,6 +116,27 @@ def _finalize_job(job_id: str, rc: int | None) -> None:
                 j["ended_at"] = datetime.utcnow().isoformat() + "Z"
                 j["exit_code"] = rc
                 return
+
+
+def _mark_stop_requested(job_id: str) -> None:
+    with _jobs_lock:
+        for j in _jobs:
+            if j["id"] == job_id:
+                if j.get("stop_requested_at") is None:
+                    j["stop_requested_at"] = datetime.utcnow().isoformat() + "Z"
+                return
+
+
+def _find_job(job_id: str) -> dict | None:
+    with _jobs_lock:
+        for j in _jobs:
+            if j["id"] == job_id:
+                return dict(j)
+    return None
+
+
+def _is_running(job: dict) -> bool:
+    return job.get("ended_at") is None
 
 
 def _current_job() -> dict | None:
@@ -177,8 +200,15 @@ def _run_script(slug: str) -> dict:
         start_new_session=True,  # survive GUI restart via setsid
     )
     # Closed in the child via subprocess; we keep a copy so the reaper
-    # below can flush the tail marker.
-    job = _register_job(slug, mode, log_path, proc.pid)
+    # below can flush the tail marker. `start_new_session=True` made
+    # the child its own process-group leader, so pid == pgid in the
+    # common case — but we read it explicitly so /api/stop can killpg
+    # without re-deriving.
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pgid = proc.pid
+    job = _register_job(slug, mode, log_path, proc.pid, pgid)
     threading.Thread(
         target=_reap, args=(proc, f, job["id"]), daemon=True
     ).start()
@@ -196,6 +226,58 @@ def _reap(proc: subprocess.Popen, fh, job_id: str) -> None:
         except Exception:
             pass
         _finalize_job(job_id, rc)
+
+
+def _stop_job(job_id: str, escalate_after_s: float = 5.0) -> dict:
+    """Signal a job's process group; SIGTERM first, SIGKILL on timeout.
+
+    Returns a small report the HTTP handler surfaces so the operator
+    sees what happened. Safe to call on an already-exited job (returns
+    a clear error), safe to call concurrently from multiple tabs
+    (duplicate SIGTERMs are harmless).
+    """
+    job = _find_job(job_id)
+    if not job:
+        return {"ok": False, "error": "unknown job_id"}
+    if not _is_running(job):
+        return {"ok": False, "error": "job already exited",
+                "exit_code": job.get("exit_code")}
+    pgid = int(job.get("pgid") or job["pid"])
+    _mark_stop_requested(job_id)
+    sent = None
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+        sent = "SIGTERM"
+    except ProcessLookupError:
+        # Group already gone; reaper will catch up.
+        return {"ok": True, "signal": "none", "note": "process group already exited"}
+    except PermissionError as e:
+        return {"ok": False, "error": f"permission denied: {e}"}
+    # Poll briefly for the reaper to flip ended_at, then escalate.
+    deadline = time.monotonic() + escalate_after_s
+    while time.monotonic() < deadline:
+        cur = _find_job(job_id) or {}
+        if not _is_running(cur):
+            return {"ok": True, "signal": sent,
+                    "exit_code": cur.get("exit_code")}
+        time.sleep(0.1)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+        sent = "SIGKILL"
+    except ProcessLookupError:
+        pass
+    except OSError as e:
+        if e.errno != errno.ESRCH:
+            return {"ok": False, "error": f"kill failed: {e}", "signal": sent}
+    # Wait a little longer for the reaper.
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        cur = _find_job(job_id) or {}
+        if not _is_running(cur):
+            return {"ok": True, "signal": sent,
+                    "exit_code": cur.get("exit_code")}
+        time.sleep(0.1)
+    return {"ok": True, "signal": sent, "note": "sent but exit not yet observed"}
 
 
 # ── Log scanning ──────────────────────────────────────────────────────
@@ -333,16 +415,23 @@ class Handler(BaseHTTPRequestHandler):
     # ── POST ─────────────────────────────────────────────────────
     def do_POST(self):  # noqa: N802
         url = urllib.parse.urlparse(self.path)
-        if not url.path.startswith("/api/run/"):
-            return self.send_error(404)
-        slug = url.path[len("/api/run/"):]
-        try:
-            job = _run_script(slug)
-        except ValueError as e:
-            return _json(self, 400, {"error": str(e)})
-        except FileNotFoundError as e:
-            return _json(self, 500, {"error": str(e)})
-        return _json(self, 200, {"ok": True, "job": job})
+        if url.path.startswith("/api/run/"):
+            slug = url.path[len("/api/run/"):]
+            try:
+                job = _run_script(slug)
+            except ValueError as e:
+                return _json(self, 400, {"error": str(e)})
+            except FileNotFoundError as e:
+                return _json(self, 500, {"error": str(e)})
+            return _json(self, 200, {"ok": True, "job": job})
+        if url.path.startswith("/api/stop/"):
+            job_id = url.path[len("/api/stop/"):]
+            if not job_id:
+                return _json(self, 400, {"error": "missing job_id"})
+            report = _stop_job(job_id)
+            code = 200 if report.get("ok") else 400
+            return _json(self, code, report)
+        return self.send_error(404)
 
     # ── Status payload ──────────────────────────────────────────
     def _status(self) -> dict:
@@ -350,10 +439,12 @@ class Handler(BaseHTTPRequestHandler):
         log_path = Path(job["log_path"]) if job else None
         text = _tail_bytes(log_path) if log_path and log_path.exists() else ""
         markers = _scan_for_markers(text)
+        running = bool(job and _is_running(job))
         return {
             "host": HOST_LABEL,
             "mode": job["mode"] if job else None,
             "current_job": job,
+            "running": running,
             "git": _git_info(REPLICA_DIR),
             "script_dir": str(SCRIPT_DIR),
             "log_dir": str(LOG_DIR),
@@ -363,6 +454,7 @@ class Handler(BaseHTTPRequestHandler):
                 for slug, (name, _) in SCRIPTS.items()
             },
             "markers": markers,
+            "recent_jobs": _all_jobs()[:8],
             "server_time": datetime.utcnow().isoformat() + "Z",
         }
 
