@@ -285,13 +285,34 @@ async fn main() -> Result<()> {
             use std::time::Duration;
 
             let (cfg, token) = load_config(&config, &token_id)?;
-            if cfg.dry_run {
-                anyhow::bail!("runtime refuses to run with dry_run=true");
+            // Paper-trading mode: the runtime now honors
+            // `cfg.dry_run`. The hot path still signs every tick and
+            // the `SubmitWorker` still drains the queue, but the
+            // inner `TradingClient::submit_signed` / cancel helpers
+            // short-circuit before any network I/O — all log-only.
+            // Makes `duration_secs` live-fire rehearsals safe on a
+            // funded wallet without committing capital.
+            let dry_run = cfg.dry_run;
+            if dry_run {
+                tracing::warn!(
+                    target: "runtime",
+                    mode = "paper",
+                    dry_run = true,
+                    "runtime starting in DRY-RUN mode — no live orders \
+                     will be submitted or cancelled"
+                );
+            } else {
+                tracing::info!(
+                    target: "runtime",
+                    mode = "live",
+                    dry_run = false,
+                    "runtime starting in LIVE mode"
+                );
             }
             // Arc<TradingClient>: shared between runtime tick (sign)
             // and submit worker (HTTP). Cheap clone.
             let client = Arc::new(TradingClient::new(
-                &cli.key, cli.nonce, false, fee_rate_bps,
+                &cli.key, cli.nonce, dry_run, fee_rate_bps,
             )?);
             load_creds_into(&cli.creds, &client)?;
 
