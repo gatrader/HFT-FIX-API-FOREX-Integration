@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 use crate::book::BookSnapshot;
 use crate::client::{PreparedSubmit, TradingClient};
 use crate::order::Side;
+use crate::position::Position;
 use crate::state_machine::{Decision, SpreadCapture, Tick};
 
 #[cfg(feature = "ws")]
@@ -72,6 +73,12 @@ pub struct RuntimeConfig {
 
     /// Size granularity for dedup bucketing (in shares).
     pub size_bucket: f64,
+
+    /// Minimum gap between cancel enqueues (ms). The state machine
+    /// says Cancel* every tick the pivot isn't firing, so at 150 ms
+    /// cadence this gate stops us from spraying ~6 cancels/s.
+    /// 500 ms = matches the submit-dedup window; safe default.
+    pub cancel_dedup_ms: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -83,6 +90,7 @@ impl Default for RuntimeConfig {
             submit_budget_per_sec: 5,
             price_bucket: 0.001,
             size_bucket: 1.0,
+            cancel_dedup_ms: 500,
         }
     }
 }
@@ -125,6 +133,19 @@ pub struct RuntimeStats {
     /// Last observed HTTP round-trip in the worker, in µs. Mirrors
     /// `submit_ms + body_ms` from the `hotpath` trace event.
     last_http_submit_us: AtomicU64,
+
+    // ── Cancel path observables ───────────────────────────────────
+    /// Cancel requests enqueued by the runtime tick — a proxy for
+    /// how often the state machine is saying "cancel what's open".
+    /// Monotonic.
+    cancel_count: AtomicU64,
+    /// Cancel requests that came back from the server as an error.
+    /// Separate counter so a cancel latency issue is distinguishable
+    /// from a pure rate problem.
+    cancel_error_count: AtomicU64,
+    /// Cancel requests dropped because the cancel queue was full
+    /// at try_send time. Same shape as `queue_full_drops`.
+    cancel_queue_full_drops: AtomicU64,
 }
 
 impl Default for RuntimeStats {
@@ -140,6 +161,9 @@ impl Default for RuntimeStats {
             queue_full_drops: AtomicU64::new(0),
             last_queue_wait_us: AtomicU64::new(0),
             last_http_submit_us: AtomicU64::new(0),
+            cancel_count: AtomicU64::new(0),
+            cancel_error_count: AtomicU64::new(0),
+            cancel_queue_full_drops: AtomicU64::new(0),
         }
     }
 }
@@ -174,6 +198,15 @@ impl RuntimeStats {
     }
     pub fn last_http_submit_us(&self) -> u64 {
         self.last_http_submit_us.load(Ordering::Relaxed)
+    }
+    pub fn cancel_count(&self) -> u64 {
+        self.cancel_count.load(Ordering::Relaxed)
+    }
+    pub fn cancel_error_count(&self) -> u64 {
+        self.cancel_error_count.load(Ordering::Relaxed)
+    }
+    pub fn cancel_queue_full_drops(&self) -> u64 {
+        self.cancel_queue_full_drops.load(Ordering::Relaxed)
     }
 }
 
@@ -216,6 +249,76 @@ pub fn size_bucket(size: f64, step: f64) -> i64 {
 pub struct SubmitJob {
     pub prepared: PreparedSubmit,
     pub enqueued_at: Instant,
+}
+
+/// A cancel trigger. The runtime signals "cancel whatever is
+/// currently open"; the worker snapshots `client.open_order_ids()`
+/// at send-time and batch-cancels. Carrying the list would be a
+/// race (new orders could land between decision and send).
+#[derive(Debug, Clone, Copy)]
+pub enum CancelJob {
+    /// Cancel every open order belonging to this account.
+    All,
+    /// Cancel the CURRENTLY-OPEN set snapshotted at worker send-
+    /// time. Used by the state-machine Cancel* paths.
+    Open,
+}
+
+/// Worker that drains `CancelJob`s and issues the matching HTTP
+/// cancel against `TradingClient`. Mirrors SubmitWorker: the
+/// runtime tick hands off; the worker owns the network cost.
+///
+/// Error policy: cancel failures are logged but not re-queued.
+/// A failed cancel is usually because the order already filled
+/// or was cancelled server-side; retrying blindly risks a stale
+/// 4xx storm.
+pub struct CancelWorker {
+    client: Arc<TradingClient>,
+    rx: mpsc::Receiver<CancelJob>,
+    stats: Arc<RuntimeStats>,
+}
+
+impl CancelWorker {
+    pub fn new(
+        client: Arc<TradingClient>,
+        rx: mpsc::Receiver<CancelJob>,
+        stats: Arc<RuntimeStats>,
+    ) -> Self {
+        Self { client, rx, stats }
+    }
+
+    pub async fn run(mut self) {
+        while let Some(job) = self.rx.recv().await {
+            let t = Instant::now();
+            let result = match job {
+                CancelJob::All => self.client.cancel_all().await,
+                CancelJob::Open => {
+                    let ids = self.client.open_order_ids();
+                    if ids.is_empty() {
+                        continue;
+                    }
+                    self.client.cancel_orders(&ids).await
+                }
+            };
+            let elapsed_us = t.elapsed().as_micros() as u64;
+            self.stats.cancel_count.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = result {
+                self.stats.cancel_error_count.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    target: "cancel_worker",
+                    error = %e, elapsed_us,
+                    "cancel failed; continuing"
+                );
+            } else {
+                tracing::debug!(
+                    target: "cancel_worker",
+                    elapsed_us, ?job,
+                    "cancel ok"
+                );
+            }
+        }
+        tracing::info!(target: "cancel_worker", "queue closed; worker exiting");
+    }
 }
 
 /// Single-consumer worker that drains `SubmitJob`s off an mpsc
@@ -288,10 +391,10 @@ pub struct Runtime {
     stats: Arc<RuntimeStats>,
     #[cfg(feature = "ws")]
     ws_stats: Option<Arc<WsStats>>,
-    /// Authoritative net_position for the runtime tick. Updated
-    /// externally via `set_net_position`; fills plumbing is a
-    /// future PR per scope constraint (3).
-    net_position: RwLock<f64>,
+    /// Authoritative net_position for the runtime tick. Shared
+    /// with the user-channel fill task (which writes) and any
+    /// future reconcile path. Read-only from this module's POV.
+    position: Position,
     /// Most recent successful submit fingerprint, for dedup.
     last_submit: RwLock<Option<SubmitRecord>>,
     /// Rolling window of submit timestamps for the budget gate.
@@ -308,6 +411,21 @@ pub struct Runtime {
     /// omit `with_submit_queue(..)` and the binary reverts to
     /// byte-identical PR 3 behavior.
     submit_tx: Option<mpsc::Sender<SubmitJob>>,
+    /// Bounded mpsc to a `CancelWorker`. When `Some`, Cancel*
+    /// state-machine decisions enqueue a `CancelJob::Open` after
+    /// the dedup gate. Missing the worker entirely leaves the
+    /// replica's cancel path as a no-op — matching the pre-B
+    /// behaviour — so a build that forgets to wire the worker
+    /// still runs, just never cancels.
+    cancel_tx: Option<mpsc::Sender<CancelJob>>,
+    /// Last time we enqueued a cancel. The state machine will
+    /// say Cancel* on every pivot-skip tick; we don't need to
+    /// hammer the server at 6 Hz. 500ms is plenty for the unwinder
+    /// live-fire.
+    last_cancel_at: RwLock<Option<Instant>>,
+    /// Minimum time between cancel enqueues. Wired to
+    /// `RuntimeConfig::cancel_dedup_ms`.
+    cancel_dedup: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -325,6 +443,7 @@ impl Runtime {
         book: Arc<RwLock<BookSnapshot>>,
         stats: Arc<RuntimeStats>,
     ) -> Self {
+        let cancel_dedup = Duration::from_millis(cfg.cancel_dedup_ms);
         Self {
             cfg,
             sm,
@@ -332,10 +451,13 @@ impl Runtime {
             stats,
             #[cfg(feature = "ws")]
             ws_stats: None,
-            net_position: RwLock::new(0.0),
+            position: Position::new(),
             last_submit: RwLock::new(None),
             submit_window: RwLock::new(VecDeque::new()),
             submit_tx: None,
+            cancel_tx: None,
+            last_cancel_at: RwLock::new(None),
+            cancel_dedup,
         }
     }
 
@@ -352,8 +474,26 @@ impl Runtime {
         self
     }
 
+    /// Route cancels through a bounded mpsc to a `CancelWorker`.
+    /// Without this, state-machine Cancel decisions are silent —
+    /// the replica stays compatible with its pre-B behaviour.
+    pub fn with_cancel_queue(mut self, tx: mpsc::Sender<CancelJob>) -> Self {
+        self.cancel_tx = Some(tx);
+        self
+    }
+
+    /// Overwrite the current net_position. Used by the CLI
+    /// `--seed-position` path and by startup REST reconcile.
+    /// Fills from the user channel should go through
+    /// `position().apply_fill()` instead.
     pub fn set_net_position(&self, v: f64) {
-        *self.net_position.write() = v;
+        self.position.seed_shares(v);
+    }
+
+    /// Clone the Position handle so the user-channel fill task
+    /// can `apply_fill` on it. Cheap — just bumps an Arc.
+    pub fn position(&self) -> Position {
+        self.position.clone()
     }
 
     pub fn stats(&self) -> Arc<RuntimeStats> {
@@ -435,6 +575,38 @@ impl Runtime {
         EmitDecision::Allowed
     }
 
+    /// Send a CancelJob::Open to the worker if the dedup window
+    /// has elapsed. No-op when the cancel queue isn't wired
+    /// (pre-B behaviour) or when the window is still hot.
+    ///
+    /// The worker snapshots `open_order_ids()` at send-time, so
+    /// this function does not need to consult the registry — we
+    /// can call it even if there are no open orders and the
+    /// worker will coalesce to a no-op.
+    fn enqueue_cancel_if_needed(&self) {
+        let Some(tx) = &self.cancel_tx else { return };
+        let now = Instant::now();
+        {
+            let last = self.last_cancel_at.read();
+            if let Some(t) = *last {
+                if now.duration_since(t) < self.cancel_dedup {
+                    return;
+                }
+            }
+        }
+        match tx.try_send(CancelJob::Open) {
+            Ok(()) => {
+                *self.last_cancel_at.write() = Some(now);
+            }
+            Err(mpsc::error::TrySendError::Full(_))
+            | Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.stats
+                    .cancel_queue_full_drops
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Call AFTER a submit was actually dispatched (success or
     /// attempt), so the dedup + budget windows are advanced.
     fn record_submit(
@@ -495,13 +667,20 @@ impl Runtime {
         let book_snap = self.book.read().clone();
         let tick = Tick {
             token_id,
-            net_position: *self.net_position.read(),
+            net_position: self.position.shares(),
             book: book_snap,
         };
 
         let decision = self.sm.decide(&tick);
-        let Decision::Emit { side, price, size, maker_amount, taker_amount, .. } = decision else {
-            return Ok(());
+        let (side, price, size, maker_amount, taker_amount) = match decision {
+            Decision::Emit { side, price, size, maker_amount, taker_amount, .. } => {
+                (side, price, size, maker_amount, taker_amount)
+            }
+            Decision::CancelPrimary | Decision::CancelSecondary => {
+                self.enqueue_cancel_if_needed();
+                return Ok(());
+            }
+            Decision::Skip => return Ok(()),
         };
 
         let now = Instant::now();

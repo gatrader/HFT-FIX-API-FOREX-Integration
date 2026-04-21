@@ -20,7 +20,7 @@ use arbigab_replica::client::TradingClient;
 use arbigab_replica::config::{BotConfig, SpreadConfig};
 use arbigab_replica::order::{pick_side, Side};
 use arbigab_replica::runtime::{
-    Runtime, RuntimeConfig, RuntimeStats, SubmitWorker,
+    CancelWorker, Runtime, RuntimeConfig, RuntimeStats, SubmitWorker,
 };
 use arbigab_replica::state_machine::{encode_amounts, SpreadCapture};
 
@@ -102,8 +102,31 @@ enum Cmd {
         config: PathBuf,
         #[arg(long)]
         token_id: String,
-        #[arg(long)]
+        /// Initial net_position seed, in shares. Overwritten by
+        /// reconcile (if enabled) and then adjusted by every fill
+        /// received on the user WS channel. For the unwinder
+        /// live-fire test this is the manually pre-positioned
+        /// share count.
+        #[arg(long, default_value_t = 0.0)]
         net_position: f64,
+        /// Condition IDs (markets) for the user WS subscribe
+        /// payload. Required when `--user-ws` is set; repeatable
+        /// for multi-market subscriptions. Ignored otherwise.
+        #[arg(long, value_name = "CONDITION_ID")]
+        market: Vec<String>,
+        /// Subscribe to the authenticated user WS channel and
+        /// apply fills to net_position as they arrive. Requires
+        /// `--features ws` and a valid creds file on disk.
+        #[arg(long, default_value_t = false)]
+        user_ws: bool,
+        /// Before the first tick, fetch the on-chain position
+        /// for `token_id` via data-api.polymarket.com/positions
+        /// and seed net_position with the returned value.
+        /// Non-fatal on error — `--net-position` then stands as
+        /// the seed. Useful as a sanity check for the live-fire
+        /// test that we actually hold the shares we think we do.
+        #[arg(long, default_value_t = false)]
+        reconcile_on_start: bool,
         #[arg(long, default_value_t = 0)]
         fee_rate_bps: u32,
         /// Tick cadence (ms). User spec: 100–250.
@@ -138,6 +161,23 @@ enum Cmd {
         /// the whole point of PR 4 is to keep ticks off HTTP.
         #[arg(long, default_value_t = false)]
         inline_submit: bool,
+        /// Minimum gap between cancel enqueues (ms). The state
+        /// machine says Cancel* every tick the pivot isn't firing;
+        /// this keeps the cancel worker from being spammed.
+        #[arg(long, default_value_t = 500)]
+        cancel_dedup_ms: u64,
+        /// Bounded mpsc capacity for the cancel worker. Same spirit
+        /// as `--submit-queue-capacity` — small is fine because the
+        /// dedup window keeps the rate low.
+        #[arg(long, default_value_t = 8)]
+        cancel_queue_capacity: usize,
+        /// Before starting the decision loop, issue one cancel-all
+        /// to clear any stale orders left from a prior process.
+        /// Honours `BotConfig.cancel_orders_on_start` if unset;
+        /// the flag is provided as an override for the bench path
+        /// where the BotConfig might carry a conservative default.
+        #[arg(long, default_value_t = false)]
+        force_cancel_on_start: bool,
     },
 }
 
@@ -233,11 +273,13 @@ async fn main() -> Result<()> {
         }
 
         Cmd::Runtime {
-            config, token_id, net_position, fee_rate_bps,
+            config, token_id, net_position, market, user_ws,
+            reconcile_on_start, fee_rate_bps,
             tick_interval_ms, book_max_age_ms, dedup_window_ms,
             submit_budget_per_sec, price_bucket, size_bucket,
             duration_secs, realtime,
             submit_queue_capacity, inline_submit,
+            cancel_dedup_ms, cancel_queue_capacity, force_cancel_on_start,
         } => {
             use std::sync::Arc;
             use std::time::Duration;
@@ -256,6 +298,7 @@ async fn main() -> Result<()> {
             let rt_cfg = RuntimeConfig {
                 tick_interval_ms, book_max_age_ms, dedup_window_ms,
                 submit_budget_per_sec, price_bucket, size_bucket,
+                cancel_dedup_ms,
             };
             let spread_cfg = SpreadConfig::from_bot(&cfg);
             let sm = SpreadCapture::new(
@@ -299,7 +342,69 @@ async fn main() -> Result<()> {
                 }
                 rt = Runtime::new(rt_cfg, sm, book.clone(), stats.clone());
             }
+            // Seed in priority order: --net-position first (the
+            // user-facing default), then overwrite with reconcile
+            // result if enabled and successful. Fills landing
+            // during startup get applied on top of whichever seed
+            // won — that's inherent to an unordered reconcile.
             rt.set_net_position(net_position);
+            if reconcile_on_start {
+                match client.fetch_position_shares(&token_id).await {
+                    Ok(on_chain) => {
+                        rt.set_net_position(on_chain);
+                        tracing::info!(
+                            target: "reconcile",
+                            token_id = %token_id,
+                            on_chain,
+                            "seeded net_position from data-api"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "reconcile",
+                            error = %e,
+                            seed = net_position,
+                            "position reconcile failed; keeping --net-position"
+                        );
+                    }
+                }
+            }
+
+            // ── Fill ingestion (user WS channel) ──────────────────
+            // Spawns an authenticated WS subscriber that applies
+            // fills to the shared Position handle. Disabled by
+            // default so dry-run and benchmark paths stay hermetic.
+            #[cfg(feature = "ws")]
+            if user_ws {
+                if market.is_empty() {
+                    anyhow::bail!(
+                        "--user-ws requires at least one --market CONDITION_ID"
+                    );
+                }
+                use arbigab_replica::user_ws::UserWsClient;
+                use arbigab_replica::ws::WsStats;
+                let creds = load_creds(&cli.creds)?;
+                let user_stats = Arc::new(WsStats::default());
+                let pos_handle = rt.position();
+                let uws = UserWsClient::new(
+                    Arc::new(creds),
+                    market.clone(),
+                    pos_handle,
+                    user_stats,
+                );
+                tokio::spawn(async move { let _ = uws.run().await; });
+                tracing::info!(
+                    target: "user_ws",
+                    markets = market.len(),
+                    "user WS fill ingest started"
+                );
+            }
+            #[cfg(not(feature = "ws"))]
+            if user_ws {
+                anyhow::bail!(
+                    "--user-ws requires building with --features ws"
+                );
+            }
 
             // ── Submit decoupling (PR 4) ──────────────────────────
             // Default: bounded mpsc + worker. Rollback: --inline-submit
@@ -322,6 +427,62 @@ async fn main() -> Result<()> {
                     "--inline-submit set: ticks will block on HTTP (PR 3 fallback)"
                 );
             }
+
+            // ── Cancel worker (B) ─────────────────────────────────
+            // Always wired. The dedup window inside Runtime keeps
+            // the rate sane, and Cancel* decisions are the state
+            // machine's only self-throttle.
+            let (ctx, crx) = tokio::sync::mpsc::channel(cancel_queue_capacity);
+            let cancel_worker = CancelWorker::new(
+                client.clone(), crx, stats.clone(),
+            );
+            tokio::spawn(cancel_worker.run());
+            rt = rt.with_cancel_queue(ctx);
+
+            // ── Startup cancel-all ─────────────────────────────────
+            // Honors BotConfig.cancel_orders_on_start and the
+            // `--force-cancel-on-start` CLI override. Fires before
+            // the first tick so the unwinder starts from a known
+            // "no resting orders" state.
+            if cfg.cancel_orders_on_start || force_cancel_on_start {
+                match client.cancel_all().await {
+                    Ok(()) => tracing::info!(
+                        target: "runtime", "startup cancel_all ok"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "runtime",
+                        error = %e,
+                        "startup cancel_all failed; continuing"
+                    ),
+                }
+            }
+
+            // ── SIGINT → cancel-all → exit ────────────────────────
+            // Signal handler runs outside tokio::select! below so
+            // Ctrl-C at any point flushes open orders before the
+            // process exits. Cloned client so the handler task
+            // owns its own reference.
+            let shutdown_client = client.clone();
+            tokio::spawn(async move {
+                if let Err(e) = tokio::signal::ctrl_c().await {
+                    tracing::error!(target: "shutdown",
+                        error = %e, "ctrl_c listener failed");
+                    return;
+                }
+                tracing::warn!(
+                    target: "shutdown",
+                    open = shutdown_client.open_order_count(),
+                    "SIGINT received; cancelling open orders"
+                );
+                if let Err(e) = shutdown_client.cancel_all().await {
+                    tracing::error!(
+                        target: "shutdown",
+                        error = %e,
+                        "cancel_all on shutdown failed"
+                    );
+                }
+                std::process::exit(0);
+            });
 
             // 1 Hz stats logger — independent cadence from the
             // decision tick so the log isn't N×/sec at 150ms ticks.
@@ -429,12 +590,17 @@ fn load_config(path: &PathBuf, token_id: &str) -> Result<(BotConfig, U256)> {
 }
 
 fn load_creds_into(path: &PathBuf, client: &TradingClient) -> Result<()> {
+    let creds = load_creds(path)?;
+    client.set_credentials(creds);
+    Ok(())
+}
+
+fn load_creds(path: &PathBuf) -> Result<ApiCredentials> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("reading creds {:?} — run bootstrap first", path))?;
     let creds: ApiCredentials = serde_json::from_slice(&bytes)
         .context("parsing credentials")?;
-    client.set_credentials(creds);
-    Ok(())
+    Ok(creds)
 }
 
 async fn run_one(

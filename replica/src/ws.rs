@@ -110,6 +110,22 @@ impl WsStats {
             Ordering::Relaxed,
         );
     }
+
+    // ── Crate-visible mirrors for the user-channel task ──────────
+    // The user WS client shares the same observability surface as
+    // the market client (connected gauge, reconnect counter, last
+    // message age). Reusing `WsStats` avoids a parallel struct;
+    // these thin shims keep the market-path internals private
+    // while letting `user_ws` call into the same fields.
+    pub(crate) fn mark_connected_public(&self, v: bool) {
+        self.mark_connected(v);
+    }
+    pub(crate) fn record_reconnect_public(&self) {
+        self.record_reconnect();
+    }
+    pub(crate) fn record_message_public(&self) {
+        self.record_message();
+    }
 }
 
 #[derive(Serialize)]

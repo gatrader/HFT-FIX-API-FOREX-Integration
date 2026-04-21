@@ -177,6 +177,7 @@ async fn runtime_realtime_dry_run() {
         submit_budget_per_sec: 5,
         price_bucket: 0.001,
         size_bucket: 1.0,
+        cancel_dedup_ms: 500,
     };
     let spread_cfg = SpreadConfig {
         order_size: 1.0,
@@ -407,6 +408,7 @@ async fn runtime_queued_submit_dry_run() {
         submit_budget_per_sec: 10,
         price_bucket: 0.001,
         size_bucket: 1.0,
+        cancel_dedup_ms: 500,
     };
     let spread_cfg = SpreadConfig {
         order_size: 1.0,

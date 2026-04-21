@@ -4,6 +4,7 @@
 //! signer-derived maker at +0x1b8 and atomic nonce at +0x1a8,
 //! except the nonce is persisted (see nonce_store.rs).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use alloy_primitives::{Address, U256};
 use parking_lot::RwLock;
 use rand::RngCore;
 use reqwest::{Client as HttpClient, Url};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::{bootstrap_credentials, l2_headers, ApiCredentials};
 use crate::book::BookSnapshot;
@@ -94,6 +95,59 @@ pub struct TradingClient {
     /// Creds behind Arc so the hot path clones a pointer (8 bytes)
     /// rather than three Strings (api_key + secret + passphrase).
     creds: RwLock<Option<Arc<ApiCredentials>>>,
+    /// Registry of maker orders we've placed and believe are still
+    /// open on Polymarket. Populated on successful POST /order from
+    /// the response's `orderID`; pruned on successful cancel (or
+    /// when the user WS channel reports a terminal status — not
+    /// wired in this minimal build).
+    ///
+    /// Keyed by orderID so batch cancels can reference them cheaply.
+    /// The map is guarded by `RwLock` because the cancel path and
+    /// the submit path update it from different tasks.
+    open_orders: RwLock<HashMap<String, OpenOrder>>,
+}
+
+/// Metadata for a maker order the replica has placed and still
+/// believes is live. All fields are local — the CLOB's ultimate
+/// truth about the order lives in the user channel / REST API.
+#[derive(Clone, Debug)]
+pub struct OpenOrder {
+    pub order_id: String,
+    pub token_id: String,
+    pub side: Side,
+    pub price: f64,
+    pub size: f64,
+    pub placed_at: Instant,
+}
+
+/// Response shape for POST /order on success. Polymarket returns
+/// `orderID` (capital D) as the canonical identifier; py-clob-client
+/// also tolerates `orderId`. We accept either spelling and fall
+/// back to `id` if neither appears — that's a safety net, not a
+/// documented behavior.
+#[derive(Debug, Deserialize)]
+struct OrderPostResponse {
+    #[serde(alias = "orderID", alias = "orderId", alias = "id")]
+    order_id: Option<String>,
+    #[serde(default)]
+    success: Option<bool>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// Body shape for DELETE /order (single cancel). Matches
+/// py-clob-client: `{"orderID": "..."}` — capital-D, not camelCase.
+#[derive(Serialize)]
+struct CancelOneBody<'a> {
+    #[serde(rename = "orderID")]
+    order_id: &'a str,
+}
+
+/// Body shape for DELETE /orders (batch cancel).
+#[derive(Serialize)]
+struct CancelBatchBody<'a> {
+    #[serde(rename = "orderIDs")]
+    order_ids: &'a [&'a str],
 }
 
 impl TradingClient {
@@ -162,6 +216,7 @@ impl TradingClient {
             dry_run,
             fee_rate_bps,
             creds: RwLock::new(None),
+            open_orders: RwLock::new(HashMap::new()),
         })
     }
 
@@ -228,6 +283,65 @@ impl TradingClient {
         Ok(())
     }
 
+    /// Fetch the current on-chain position for `token_id` (asset_id).
+    ///
+    /// Hits Polymarket's public data-api positions endpoint. This is
+    /// the same source the UI reads — returns the settled on-chain
+    /// balance, not the theoretical CLOB open-order inventory, so a
+    /// freshly placed maker order is NOT reflected until it fills.
+    ///
+    /// Returns `Ok(shares)` where `shares` is signed per convention
+    /// (positive = long the YES outcome). `Ok(0.0)` when the user
+    /// has no position in this asset. Errors propagate — callers
+    /// wishing to continue past a reconcile failure should log and
+    /// ignore (e.g. the runtime bootstrap path).
+    pub async fn fetch_position_shares(
+        &self,
+        token_id: &str,
+    ) -> Result<f64, ClientError> {
+        // The data-api hostname is distinct from CLOB and does not
+        // live under `self.base_url`, so construct fresh.
+        let url = Url::parse(
+            "https://data-api.polymarket.com/positions",
+        )?;
+        let maker_lc = format!("{:#x}", self.maker);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[("user", maker_lc.as_str()), ("asset", token_id)])
+            .send()
+            .await?
+            .error_for_status()?;
+        let body = resp.text().await?;
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| ClientError::Other(format!(
+                "parse positions: {e}; body={body}"
+            )))?;
+        // The endpoint returns a JSON array of position objects; each
+        // carries `asset` and `size` (as string or number). Sum matching
+        // legs — normally at most one.
+        let arr = match &v {
+            serde_json::Value::Array(a) => a.as_slice(),
+            _ => return Err(ClientError::Other(format!(
+                "positions: unexpected shape: {body}"
+            ))),
+        };
+        let mut total = 0.0;
+        for entry in arr {
+            let asset = entry.get("asset").and_then(|x| x.as_str());
+            if asset != Some(token_id) {
+                continue;
+            }
+            let size = match entry.get("size") {
+                Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+                Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            total += size;
+        }
+        Ok(total)
+    }
+
     /// place_single_order (FINAL_AUDIT §9).
     ///
     /// Staged instrumentation emits a single `hotpath` tracing event
@@ -286,6 +400,156 @@ impl TradingClient {
             request_id,
             sign_us,
         })
+    }
+
+    /// Snapshot of the currently-open order IDs. O(n). Callers
+    /// wanting a consistent batch should call this then pass the
+    /// result to `cancel_orders` — no locks are held across.
+    pub fn open_order_ids(&self) -> Vec<String> {
+        self.open_orders.read().keys().cloned().collect()
+    }
+
+    /// Number of orders the registry believes are live. Useful as
+    /// a dedup input for the runtime's cancel-trigger path (don't
+    /// emit a cancel request when there's nothing to cancel).
+    pub fn open_order_count(&self) -> usize {
+        self.open_orders.read().len()
+    }
+
+    /// Record a freshly-placed order in the open-order registry.
+    /// Exposed as `pub(crate)` so the runtime / worker can stage
+    /// metadata on successful POST paths (including the test-only
+    /// dry-run one) without needing to inspect raw JSON.
+    pub(crate) fn record_open_order(&self, info: OpenOrder) {
+        self.open_orders.write().insert(info.order_id.clone(), info);
+    }
+
+    /// Drop an order from the registry. Called after a successful
+    /// cancel; also safe to call when the order is not present
+    /// (no-op).
+    fn forget_open_order(&self, order_id: &str) {
+        self.open_orders.write().remove(order_id);
+    }
+
+    /// Cancel a single order by its Polymarket orderID. DELETE /order
+    /// with `{"orderID": "..."}`. Idempotent on the server side; we
+    /// treat 404 as success (already cancelled / filled).
+    ///
+    /// dry_run short-circuits: cancel path has no offline stub to
+    /// exercise in a dry-run harness, so we log and drop the registry
+    /// entry without touching the network.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<(), ClientError> {
+        if self.dry_run {
+            tracing::info!(target: "dry_run_cancel", order_id, "cancel (dry_run)");
+            self.forget_open_order(order_id);
+            return Ok(());
+        }
+        let body = serde_json::to_string(&CancelOneBody { order_id })
+            .map_err(|e| ClientError::Other(e.to_string()))?;
+        self.send_cancel("DELETE", "/order", &body).await?;
+        self.forget_open_order(order_id);
+        Ok(())
+    }
+
+    /// Cancel a batch of orders in one request. DELETE /orders
+    /// with `{"orderIDs": [...]}`. Empty input returns Ok with no
+    /// HTTP call — saves a round trip when the registry is empty.
+    pub async fn cancel_orders(
+        &self,
+        order_ids: &[String],
+    ) -> Result<(), ClientError> {
+        if order_ids.is_empty() {
+            return Ok(());
+        }
+        if self.dry_run {
+            for id in order_ids {
+                self.forget_open_order(id);
+            }
+            tracing::info!(
+                target: "dry_run_cancel",
+                n = order_ids.len(),
+                "batch cancel (dry_run)"
+            );
+            return Ok(());
+        }
+        let refs: Vec<&str> = order_ids.iter().map(String::as_str).collect();
+        let body = serde_json::to_string(&CancelBatchBody { order_ids: &refs })
+            .map_err(|e| ClientError::Other(e.to_string()))?;
+        self.send_cancel("DELETE", "/orders", &body).await?;
+        for id in order_ids {
+            self.forget_open_order(id);
+        }
+        Ok(())
+    }
+
+    /// Cancel every open order on the account. DELETE /cancel-all
+    /// with an empty body. Stronger than iterating the local
+    /// registry — the server owns the ground truth, so even orders
+    /// the replica lost track of (e.g. across restarts) get killed.
+    pub async fn cancel_all(&self) -> Result<(), ClientError> {
+        if self.dry_run {
+            self.open_orders.write().clear();
+            tracing::info!(target: "dry_run_cancel", "cancel_all (dry_run)");
+            return Ok(());
+        }
+        self.send_cancel("DELETE", "/cancel-all", "").await?;
+        self.open_orders.write().clear();
+        Ok(())
+    }
+
+    /// Core HTTP helper for the three cancel endpoints. Builds the
+    /// L2-signed request and translates non-2xx into `ClientError`.
+    /// A 404 is NOT treated as a success, since the cancel endpoints
+    /// (unlike a REST READ) should 200 even when there's nothing to
+    /// cancel; see py-clob-client's cancel() for the analogous
+    /// behaviour.
+    async fn send_cancel(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<(), ClientError> {
+        let creds = self
+            .creds
+            .read()
+            .clone()
+            .ok_or_else(|| ClientError::Other(
+                "no API credentials — call bootstrap() or set_credentials() first"
+                    .into(),
+            ))?;
+        // `path` here is the CLOB-relative path for the HMAC canonical
+        // string (`/order`, `/orders`, `/cancel-all`). The URL joined
+        // against base_url must match — base_url is already the CLOB
+        // root with a trailing slash, so strip any leading slash.
+        let url = self.base_url.join(path.trim_start_matches('/'))?;
+        let headers = l2_headers(
+            self.maker, &creds, Self::now_ts(), method, path, body,
+        )
+        .map_err(|e| ClientError::Other(e.to_string()))?;
+        let mut req = self
+            .http
+            .request(method.parse().unwrap_or(reqwest::Method::DELETE), url)
+            .header("Content-Type", "application/json")
+            .body(body.to_string());
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let t = Instant::now();
+        let resp = req.send().await?;
+        let elapsed_ms = t.elapsed().as_millis() as u64;
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        tracing::info!(
+            target: "cancel",
+            method, path, status = %status, elapsed_ms,
+            "cancel complete"
+        );
+        if !status.is_success() {
+            return Err(ClientError::Other(
+                format!("cancel {method} {path} {status}: {body_text}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Submit-only half — pure I/O. Callable from a worker task
@@ -371,6 +635,54 @@ impl TradingClient {
             ));
         }
         tracing::info!(target: "order_response", status = %status, body = %body_text);
+
+        // Registry insert — capture the orderID so the cancel path
+        // can later target this specific order. Best-effort: parse
+        // failure is logged but not fatal, since we already have a
+        // 2xx and the caller's next action is to keep trading.
+        //
+        // We reconstruct the OpenOrder metadata from the signed
+        // body rather than threading it through function signatures
+        // — the JSON round-trip is ~1µs and only fires on the real
+        // (non-dry-run, 2xx) path.
+        if let Ok(resp) = serde_json::from_str::<OrderPostResponse>(&body_text) {
+            if let Some(oid) = resp.order_id {
+                // Decode price/size back out of the order struct.
+                // `makerAmount` and `takerAmount` are stored as strings
+                // of 6-decimal integers (Polymarket's convention).
+                let m = signed.order.maker_amount.parse::<u128>().unwrap_or(0) as f64;
+                let t = signed.order.taker_amount.parse::<u128>().unwrap_or(0) as f64;
+                let side = if signed.order.side == "BUY" {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                };
+                let (price, size) = match side {
+                    // BUY: maker = notional (price*size*scale), taker = size*scale
+                    Side::Buy if t > 0.0 => (m / t, t / 1_000_000.0),
+                    // SELL: maker = size*scale, taker = notional
+                    Side::Sell if m > 0.0 => (t / m, m / 1_000_000.0),
+                    _ => (0.0, 0.0),
+                };
+                self.record_open_order(OpenOrder {
+                    order_id: oid.clone(),
+                    token_id: signed.order.token_id.clone(),
+                    side,
+                    price,
+                    size,
+                    placed_at: Instant::now(),
+                });
+                tracing::debug!(
+                    target: "open_orders",
+                    order_id = %oid,
+                    open_count = self.open_order_count(),
+                    status = ?resp.status,
+                    success = ?resp.success,
+                    "registered"
+                );
+            }
+        }
+
         Ok(())
     }
 }

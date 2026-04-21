@@ -216,6 +216,7 @@ async fn run_arm(queued: bool, sleep_ms: u64, duration_ms: u64) -> ArmResult {
         submit_budget_per_sec: 10,
         price_bucket: 0.001,
         size_bucket: 1.0,
+        cancel_dedup_ms: 500,
     };
     let spread_cfg = SpreadConfig {
         order_size: 1.0,

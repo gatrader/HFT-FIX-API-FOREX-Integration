@@ -13,10 +13,13 @@ pub mod client;
 pub mod config;
 pub mod nonce_store;
 pub mod order;
+pub mod position;
 pub mod runtime;
 pub mod signer;
 pub mod state_machine;
 
+#[cfg(feature = "ws")]
+pub mod user_ws;
 #[cfg(feature = "ws")]
 pub mod ws;
 
