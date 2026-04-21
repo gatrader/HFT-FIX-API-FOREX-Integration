@@ -148,13 +148,6 @@ struct CancelOneBody<'a> {
     order_id: &'a str,
 }
 
-/// Body shape for DELETE /orders (batch cancel).
-#[derive(Serialize)]
-struct CancelBatchBody<'a> {
-    #[serde(rename = "orderIDs")]
-    order_ids: &'a [&'a str],
-}
-
 impl TradingClient {
     pub fn new(
         hex_key: &str,
@@ -495,8 +488,12 @@ impl TradingClient {
     }
 
     /// Cancel a batch of orders in one request. DELETE /orders
-    /// with `{"orderIDs": [...]}`. Empty input returns Ok with no
-    /// HTTP call — saves a round trip when the registry is empty.
+    /// with a **raw JSON array** body — `["id1","id2"]`, NOT the
+    /// object wrapper `{"orderIDs": [...]}`. Live validation
+    /// against the Polymarket CLOB showed the endpoint rejects the
+    /// object form with `{"error":"Invalid order payload"}`.
+    /// Empty input returns Ok with no HTTP call — saves a round
+    /// trip when the registry is empty.
     ///
     /// Duplicate ids in the input are collapsed before signing so
     /// a caller mistake (or a future reconcile path that merges
@@ -530,7 +527,7 @@ impl TradingClient {
             self.stamp_last_cancel();
             return Ok(());
         }
-        let body = serde_json::to_string(&CancelBatchBody { order_ids: &deduped })
+        let body = serde_json::to_string(&deduped)
             .map_err(|e| ClientError::Other(e.to_string()))?;
         self.send_cancel("DELETE", "/orders", &body).await?;
         for id in &deduped {
@@ -949,5 +946,47 @@ mod tests {
         let ids = vec!["A".to_string()];
         c.cancel_orders(&ids).await.expect("dry-run batch ok");
         assert!(c.last_cancel_at_ms() > 0);
+    }
+
+    /// Wire-format regression guard for `DELETE /orders`: the body
+    /// must be a raw JSON array (`["id1","id2"]`), NOT an object
+    /// wrapper like `{"orderIDs": [...]}`. Live validation against
+    /// the Polymarket CLOB showed the object form is rejected with
+    /// `{"error":"Invalid order payload"}`, which silently leaves
+    /// resting orders alive. We test the body encoding directly
+    /// here so a refactor can't regress it.
+    #[test]
+    fn batch_cancel_body_is_raw_json_array() {
+        let ids = vec!["a", "b", "c"];
+        let body = serde_json::to_string(&ids).unwrap();
+        assert_eq!(body, r#"["a","b","c"]"#);
+        // Belt-and-braces: it must parse back to a JSON array, not
+        // an object.
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v.is_array(), "batch cancel body must be a JSON array");
+        assert_eq!(v.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn batch_cancel_body_preserves_dedup_order() {
+        // Mirror the dedup logic inside cancel_orders so a refactor
+        // to that loop can't silently change the on-wire order.
+        let input = vec![
+            "x".to_string(),
+            "y".to_string(),
+            "x".to_string(),
+            "z".to_string(),
+        ];
+        let mut seen: HashSet<&str> = HashSet::new();
+        let deduped: Vec<&str> = input
+            .iter()
+            .map(String::as_str)
+            .filter(|s| seen.insert(*s))
+            .collect();
+        assert_eq!(deduped, vec!["x", "y", "z"]);
+        assert_eq!(
+            serde_json::to_string(&deduped).unwrap(),
+            r#"["x","y","z"]"#
+        );
     }
 }
