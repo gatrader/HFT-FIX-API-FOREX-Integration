@@ -13,8 +13,12 @@ pub mod client;
 pub mod config;
 pub mod nonce_store;
 pub mod order;
+pub mod runtime;
 pub mod signer;
 pub mod state_machine;
+
+#[cfg(feature = "ws")]
+pub mod ws;
 
 pub use config::{BotConfig, SpreadConfig, TradeSideMode};
 pub use order::{ClobOrder, Side};

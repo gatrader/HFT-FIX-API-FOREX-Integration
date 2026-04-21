@@ -16,7 +16,7 @@ anyhow      = "1"
 rand        = "0.8"
 clap        = { version = "4", features = ["derive", "env"] }
 tracing     = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 parking_lot = "0.12"
 
 alloy-primitives     = "0.8"
@@ -29,6 +29,20 @@ hmac                 = "0.12"
 sha2                 = "0.10"
 base64               = "0.22"
 chrono               = "0.4"
+
+# WS ingest — gated behind the `ws` feature so CI default stays
+# lean and we only pull tungstenite when actually building with
+# --features ws. Uses rustls to match the rest of the TLS stack
+# (reqwest also uses rustls above).
+tokio-tungstenite = { version = "0.23", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
+futures-util      = { version = "0.3", optional = true }
+
+[features]
+default = []
+# Enables src/ws.rs + the `ws-probe` subcommand.
+# REST path remains the rollback default; --realtime in PR 3 will
+# be the runtime switch between WS ingest and REST poll.
+ws = ["dep:tokio-tungstenite", "dep:futures-util"]
 
 [dev-dependencies]
 tempfile = "3"
