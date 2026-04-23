@@ -71,12 +71,16 @@ KNOWN_FILTERS = [
 
 # Optional markers for the status card. None of these fail the build
 # if absent — the card just shows "—".
+# Phrases verified against replica/src/user_ws.rs — the connected
+# marker is emitted once from the "ready" path (line 376), the two
+# disconnect markers are the exact warn! bodies the reconnect loop
+# logs on session close (line 327) and dial failure (line 337).
 USER_WS_CONNECTED_MARKERS = [
     "user channel connected + subscribed",
 ]
 USER_WS_DISCONNECTED_MARKERS = [
-    "user_ws disconnected",
-    "user_ws task exited",
+    "user-channel session closed",
+    "user-channel connection failed",
 ]
 
 # ── Job registry ──────────────────────────────────────────────────────
@@ -321,7 +325,7 @@ def _scan_for_markers(text: str) -> dict:
             last["reject"] = line
         elif "fill applied" in line:
             last["fill"] = line
-        elif "startup cancel_all ok" in line or "cancel_all on shutdown ok" in line:
+        elif "startup cancel_all ok" in line:
             last["cancel_all"] = line
         elif "duration reached" in line:
             last["duration"] = line

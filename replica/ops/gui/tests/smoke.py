@@ -42,11 +42,17 @@ def mk_fake_scripts(dir_: Path) -> None:
     # `paper` exits quickly and prints every marker — exercises the
     # status-card path and the log filter path in one run.
     (dir_ / "replica-paper.sh").write_text(
+        # Includes a user-WS "connected" and "disconnected" marker so
+        # the status-card WS logic is exercised end-to-end. The
+        # disconnect phrase matches the exact warn! body from
+        # replica/src/user_ws.rs (reconnect path on session close).
         "#!/usr/bin/env bash\n"
         "echo 'paper: starting'\n"
         "echo 'startup cancel_all ok'\n"
+        "echo 'user channel connected + subscribed'\n"
         "echo 'submit complete id=1'\n"
         "echo 'fill applied'\n"
+        "echo 'user-channel session closed before HEALTHY_SESSION_MIN'\n"
         "echo 'duration reached'\n"
     )
     # `live5m` sleeps long enough that we can observe `running` state
@@ -176,6 +182,23 @@ def main() -> int:
         lines = json.loads(body)["lines"]
         expect(all("fill applied" in ln for ln in lines) and lines,
                "filter=fill applied keeps only matching lines")
+
+        # Status markers — the fake paper log has a connect line
+        # followed by a real-replica disconnect phrase, so the last
+        # observed ws_connected state must be False.
+        code, body = http_get(f"{base}/api/status")
+        s = json.loads(body)
+        mk = s.get("markers") or {}
+        expect(mk.get("ws_connected") is False,
+               f"ws_connected reflects last 'user-channel session closed' (got {mk.get('ws_connected')!r})")
+        expect(mk.get("submit") and "submit complete" in mk["submit"],
+               "markers.submit populated from log")
+        expect(mk.get("fill") and "fill applied" in mk["fill"],
+               "markers.fill populated from log")
+        expect(mk.get("cancel_all") and "startup cancel_all ok" in mk["cancel_all"],
+               "markers.cancel_all populated from log")
+        expect(mk.get("duration") and "duration reached" in mk["duration"],
+               "markers.duration populated from log")
 
         # Stop on an already-exited job returns a clear error.
         code, body = http_post(f"{base}/api/stop/{paper_job['id']}")
