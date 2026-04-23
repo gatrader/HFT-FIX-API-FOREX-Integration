@@ -35,6 +35,77 @@ class WorkingOrder:
         return asdict(self)
 
 
+def working_order_exposure(
+    orders: list[WorkingOrder],
+    *,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    active = (
+        prune_expired_orders(orders, now_ts)
+        if now_ts is not None
+        else [order for order in orders if order.remaining_size > 1e-9]
+    )
+    by_outcome: dict[str, dict[str, Any]] = {}
+    ages: list[float] = []
+    for order in active:
+        bucket = by_outcome.setdefault(
+            order.outcome,
+            {
+                "count": 0,
+                "remainingSize": 0.0,
+                "oldestCreatedTimestamp": order.created_timestamp,
+                "newestUpdatedTimestamp": order.updated_timestamp,
+            },
+        )
+        bucket["count"] += 1
+        bucket["remainingSize"] += order.remaining_size
+        bucket["oldestCreatedTimestamp"] = min(bucket["oldestCreatedTimestamp"], order.created_timestamp)
+        bucket["newestUpdatedTimestamp"] = max(bucket["newestUpdatedTimestamp"], order.updated_timestamp)
+        if now_ts is not None:
+            ages.append(max(0.0, now_ts - order.created_timestamp))
+    for bucket in by_outcome.values():
+        bucket["remainingSize"] = round(bucket["remainingSize"], 6)
+        bucket["oldestCreatedTimestamp"] = round(bucket["oldestCreatedTimestamp"], 6)
+        bucket["newestUpdatedTimestamp"] = round(bucket["newestUpdatedTimestamp"], 6)
+    return {
+        "orderCount": len(active),
+        "byOutcome": by_outcome,
+        "averageOrderAgeSeconds": round(sum(ages) / len(ages), 6) if ages else 0.0,
+        "maxOrderAgeSeconds": round(max(ages), 6) if ages else 0.0,
+    }
+
+
+def consume_working_order_fills(
+    orders: list[WorkingOrder],
+    fills: list[dict[str, Any]],
+    *,
+    now_ts: float,
+) -> list[WorkingOrder]:
+    active = prune_expired_orders(orders, now_ts)
+    for fill in fills:
+        try:
+            outcome = str(fill["outcome"])
+            remaining = float(fill["size"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if remaining <= 1e-9:
+            continue
+        candidates = [
+            order
+            for order in active
+            if order.outcome == outcome and order.remaining_size > 1e-9
+        ]
+        candidates.sort(key=lambda order: (order.created_timestamp, order.layer, order.price))
+        for order in candidates:
+            if remaining <= 1e-9:
+                break
+            matched = min(order.remaining_size, remaining)
+            order.remaining_size -= matched
+            order.updated_timestamp = now_ts
+            remaining -= matched
+    return prune_expired_orders(active, now_ts)
+
+
 def ladder_intent_from_action(action: dict[str, Any]) -> LadderIntent:
     outcome = str(action["outcome"])
     mode = str(action.get("mode") or "")
@@ -89,10 +160,12 @@ def reconcile_orders(
     ttl_seconds: float,
     cycle_index: int,
     slug: str,
+    price_tolerance: float = 0.01,
+    size_tolerance: float = 0.01,
 ) -> tuple[list[WorkingOrder], dict[str, Any]]:
     existing_orders = prune_expired_orders(existing_orders, now_ts)
-    existing_by_key = {order.key: order for order in existing_orders}
     target_intents = [ladder_intent_from_action(action) for action in actions]
+    unmatched_existing = list(existing_orders)
 
     next_orders: list[WorkingOrder] = []
     created: list[dict[str, Any]] = []
@@ -100,23 +173,32 @@ def reconcile_orders(
     preserved: list[dict[str, Any]] = []
     cancelled: list[dict[str, Any]] = []
 
-    target_keys = {intent.key for intent in target_intents}
-    for order in existing_orders:
-        if order.key not in target_keys:
-            cancelled.append(
-                {
-                    "orderId": order.order_id,
-                    "key": order.key,
-                    "outcome": order.outcome,
-                    "mode": order.mode,
-                    "remainingSize": round(order.remaining_size, 6),
-                    "price": round(order.price, 6),
-                    "reason": "not_in_target_ladder",
-                }
+    def _take_match(intent: LadderIntent) -> WorkingOrder | None:
+        exact_index = next(
+            (index for index, order in enumerate(unmatched_existing) if order.key == intent.key),
+            None,
+        )
+        if exact_index is not None:
+            return unmatched_existing.pop(exact_index)
+        reusable_candidates = [
+            (index, order)
+            for index, order in enumerate(unmatched_existing)
+            if order.outcome == intent.outcome and order.mode == intent.mode
+        ]
+        reusable_candidates.sort(
+            key=lambda row: (
+                abs(row[1].price - intent.price),
+                abs(row[1].size - intent.size),
+                row[1].created_timestamp,
             )
+        )
+        for index, order in reusable_candidates:
+            if abs(order.price - intent.price) <= price_tolerance + 1e-9:
+                return unmatched_existing.pop(index)
+        return None
 
     for index, intent in enumerate(target_intents, start=1):
-        current = existing_by_key.get(intent.key)
+        current = _take_match(intent)
         if current is None:
             new_order = WorkingOrder(
                 order_id=f"{slug}.c{cycle_index:03d}.o{index:02d}",
@@ -135,7 +217,13 @@ def reconcile_orders(
             created.append(new_order.to_dict())
             continue
 
-        changed = abs(current.price - intent.price) > 1e-9 or abs(current.size - intent.size) > 1e-9
+        changed = (
+            abs(current.price - intent.price) > price_tolerance + 1e-9
+            or abs(current.size - intent.size) > size_tolerance + 1e-9
+            or current.key != intent.key
+        )
+        current.key = intent.key
+        current.layer = intent.layer
         current.price = intent.price
         current.size = intent.size
         current.remaining_size = min(current.remaining_size, intent.size)
@@ -146,6 +234,19 @@ def reconcile_orders(
             amended.append(current.to_dict())
         else:
             preserved.append(current.to_dict())
+
+    for order in unmatched_existing:
+        cancelled.append(
+            {
+                "orderId": order.order_id,
+                "key": order.key,
+                "outcome": order.outcome,
+                "mode": order.mode,
+                "remainingSize": round(order.remaining_size, 6),
+                "price": round(order.price, 6),
+                "reason": "not_in_target_ladder",
+            }
+        )
 
     next_orders.sort(key=lambda order: (order.outcome, order.mode, order.layer, order.price))
     return next_orders, {

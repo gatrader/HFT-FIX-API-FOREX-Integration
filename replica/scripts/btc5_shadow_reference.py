@@ -21,6 +21,7 @@ from run_replica_btc5_accumulator import (
     compute_inventory_state,
     decide_actions,
     fetch_wallet_trades,
+    session_risk_context,
     serialize_fills,
     snapshot_quotes,
 )
@@ -542,6 +543,18 @@ def summarize_shadow_window(session: dict[str, Any], event: dict[str, Any], refe
         (cycle["quotes"]["pairQuotedCost"] for cycle in session["cycles"] if cycle["quotes"].get("pairQuotedCost") is not None),
         default=None,
     )
+    projected_residuals = [
+        float((cycle.get("sessionRiskAfterDecision") or cycle.get("sessionRiskBeforeDecision") or {}).get("projected", {}).get("residualQty") or 0.0)
+        for cycle in session["cycles"]
+    ]
+    average_working_orders = [
+        float((cycle.get("sessionRiskAfterDecision") or cycle.get("sessionRiskBeforeDecision") or {}).get("workingOrders", {}).get("orderCount") or 0.0)
+        for cycle in session["cycles"]
+    ]
+    average_order_age = [
+        float((cycle.get("sessionRiskAfterDecision") or cycle.get("sessionRiskBeforeDecision") or {}).get("workingOrders", {}).get("averageOrderAgeSeconds") or 0.0)
+        for cycle in session["cycles"]
+    ]
     return {
         "slug": event["slug"],
         "title": event["title"],
@@ -565,6 +578,13 @@ def summarize_shadow_window(session: dict[str, Any], event: dict[str, Any], refe
         if first_reference_ts is None
         else round(first_reference_ts - start_ts, 3),
         "bestPairQuoteSeen": best_pair_quote,
+        "maxProjectedResidualQty": round(max(projected_residuals), 6) if projected_residuals else 0.0,
+        "averageWorkingOrderCount": round(sum(average_working_orders) / len(average_working_orders), 6)
+        if average_working_orders
+        else 0.0,
+        "averageOrderAgeSeconds": round(sum(average_order_age) / len(average_order_age), 6)
+        if average_order_age
+        else 0.0,
         "shadowFinalState": {
             "pairedQty": round(shadow_state.paired_qty, 6),
             "pairedAvgCost": round_or_none(shadow_state.paired_avg_cost),
@@ -591,8 +611,8 @@ def render_shadow_markdown(payload: dict[str, Any]) -> str:
         "",
         "## Window Summary",
         "",
-        "| Window | Ref rows | Ref tx | Shadow ops | Shadow targets | Shadow fills | First shadow action (s) | First ref trade (s) | Best pair quote | Shadow residual |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| Window | Ref rows | Ref tx | Shadow ops | Shadow targets | Shadow fills | Avg working orders | Avg order age (s) | Max projected residual | First shadow action (s) | First ref trade (s) | Best pair quote | Shadow residual |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in payload["windows"]:
         residual = row["shadowFinalState"]["residualSide"]
@@ -604,6 +624,7 @@ def render_shadow_markdown(payload: dict[str, Any]) -> str:
         lines.append(
             f"| {row['title']} | {row['referenceTradeRows']} | {row['referenceDistinctTx']} | "
             f"{row['shadowActionCount']} | {row['shadowTargetCount']} | {row['shadowFillCount']} | "
+            f"{row['averageWorkingOrderCount']} | {row['averageOrderAgeSeconds']} | {row['maxProjectedResidualQty']} | "
             f"{row['shadowFirstActionSeconds'] if row['shadowFirstActionSeconds'] is not None else '-'} | "
             f"{row['referenceFirstTradeSeconds'] if row['referenceFirstTradeSeconds'] is not None else '-'} | "
             f"{row['bestPairQuoteSeen'] if row['bestPairQuoteSeen'] is not None else '-'} | {residual_text} |"
@@ -767,6 +788,12 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
         session["referenceSeenHashes"].add(row.transaction_hash)
     match_shadow_orders(session, new_reference_fills)
     state = compute_inventory_state(session["shadowFills"])
+    session_context = session_risk_context(
+        state=state,
+        working_orders=session["openOrders"],
+        clip_shares=args.clip_shares,
+        now_ts=now_ts,
+    )
     event = session["event"]
     market_books, market_warning = resilient_market_books(event)
     if market_books is None:
@@ -776,6 +803,7 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
             "timestampUtc": now_utc_iso(),
             "secondsLeft": seconds_left,
             "inventory": state.to_dict(),
+            "sessionRiskBeforeDecision": session_context,
             "quotes": {},
             "decision": {
                 "secondsLeft": seconds_left,
@@ -800,6 +828,7 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
     decision = decide_actions(
         event=event,
         state=state,
+        session_context=session_context,
         quotes=quotes,
         clip_shares=args.clip_shares,
         entry_threshold=args.entry_threshold,
@@ -829,6 +858,7 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
         "timestampUtc": now_utc_iso(),
         "secondsLeft": decision["secondsLeft"],
         "inventory": state.to_dict(),
+        "sessionRiskBeforeDecision": session_context,
         "quotes": quotes,
         "decision": decision,
     }
@@ -861,6 +891,12 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
         cycle["targetLadder"] = ladder_summary(decision["actions"])
         cycle["ladderReconcile"] = reconcile_summary
         cycle["openOrdersAfterReconcile"] = [row.to_dict() for row in session["openOrders"]]
+        cycle["sessionRiskAfterDecision"] = session_risk_context(
+            state=state,
+            working_orders=session["openOrders"],
+            clip_shares=args.clip_shares,
+            now_ts=placed_at,
+        )
         for operation_name in ("created", "amended", "cancelled"):
             for row in reconcile_summary.get(operation_name, []):
                 session["shadowActions"].append(
@@ -872,6 +908,8 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
                         **row,
                     }
                 )
+    if "sessionRiskAfterDecision" not in cycle:
+        cycle["sessionRiskAfterDecision"] = session_context
     sleep_for = max(0.0, args.poll_seconds)
     session["cycles"].append(cycle)
     return sleep_for
@@ -1020,6 +1058,9 @@ def cmd_record(args: argparse.Namespace) -> int:
             "shadowActionCount": row["shadowActionCount"],
             "shadowTargetCount": row["shadowTargetCount"],
             "shadowFillCount": row["shadowFillCount"],
+            "averageWorkingOrderCount": row["averageWorkingOrderCount"],
+            "averageOrderAgeSeconds": row["averageOrderAgeSeconds"],
+            "maxProjectedResidualQty": row["maxProjectedResidualQty"],
             "shadowFirstActionSeconds": row["shadowFirstActionSeconds"],
             "referenceFirstTradeSeconds": row["referenceFirstTradeSeconds"],
             "bestPairQuoteSeen": row["bestPairQuoteSeen"],
@@ -1046,6 +1087,9 @@ def cmd_record(args: argparse.Namespace) -> int:
             "shadowActionCount",
             "shadowTargetCount",
             "shadowFillCount",
+            "averageWorkingOrderCount",
+            "averageOrderAgeSeconds",
+            "maxProjectedResidualQty",
             "shadowFirstActionSeconds",
             "referenceFirstTradeSeconds",
             "bestPairQuoteSeen",

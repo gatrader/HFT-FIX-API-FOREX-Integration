@@ -12,7 +12,14 @@ from typing import Any
 
 import requests
 
-from btc5_ladder_manager import ladder_summary
+from btc5_ladder_manager import (
+    WorkingOrder,
+    consume_working_order_fills,
+    ladder_summary,
+    prune_expired_orders,
+    reconcile_orders,
+    working_order_exposure,
+)
 from btc5_market_feed import RestPollingMarketFeed
 from resolve_next_btc5 import resolve
 from run_replica_btc5_paired import (
@@ -404,6 +411,15 @@ def best_bid(book: dict[str, Any]) -> BookQuote | None:
     return BookQuote(price=price, size=size)
 
 
+def best_ask(book: dict[str, Any]) -> BookQuote | None:
+    asks = parse_levels(book.get("asks", []))
+    if not asks:
+        return None
+    price = min(level.price for level in asks)
+    size = sum(level.size for level in asks if abs(level.price - price) < 1e-9)
+    return BookQuote(price=price, size=size)
+
+
 def fetch_wallet_trades(
     *,
     wallet: str,
@@ -515,6 +531,72 @@ def maybe_round(value: float | None) -> float | None:
     return round(value, 6)
 
 
+def working_remaining_size(exposure: dict[str, Any], outcome: str) -> float:
+    bucket = exposure.get("byOutcome", {}).get(outcome, {})
+    return float(bucket.get("remainingSize") or 0.0)
+
+
+def projected_inventory_snapshot(
+    state: InventoryState,
+    *,
+    outstanding_up: float,
+    outstanding_down: float,
+    clip_shares: float,
+) -> dict[str, Any]:
+    projected_up = state.up_qty + max(0.0, outstanding_up)
+    projected_down = state.down_qty + max(0.0, outstanding_down)
+    projected_paired = min(projected_up, projected_down)
+    projected_residual_qty = abs(projected_up - projected_down)
+    projected_residual_side = None
+    if projected_up > projected_down:
+        projected_residual_side = "Up"
+    elif projected_down > projected_up:
+        projected_residual_side = "Down"
+    projected_ratio = projected_residual_qty / max(projected_paired, clip_shares, ORDER_SIZE_STEP)
+    return {
+        "upQty": round(projected_up, 6),
+        "downQty": round(projected_down, 6),
+        "pairedQty": round(projected_paired, 6),
+        "residualQty": round(projected_residual_qty, 6),
+        "residualSide": projected_residual_side,
+        "residualRatio": round(projected_ratio, 6),
+    }
+
+
+def session_risk_context(
+    *,
+    state: InventoryState,
+    working_orders: list[WorkingOrder],
+    clip_shares: float,
+    now_ts: float,
+) -> dict[str, Any]:
+    exposure = working_order_exposure(working_orders, now_ts=now_ts)
+    outstanding_up = working_remaining_size(exposure, "Up")
+    outstanding_down = working_remaining_size(exposure, "Down")
+    outstanding_paired = min(outstanding_up, outstanding_down)
+    outstanding_residual_qty = abs(outstanding_up - outstanding_down)
+    outstanding_residual_side = None
+    if outstanding_up > outstanding_down:
+        outstanding_residual_side = "Up"
+    elif outstanding_down > outstanding_up:
+        outstanding_residual_side = "Down"
+    projected = projected_inventory_snapshot(
+        state,
+        outstanding_up=outstanding_up,
+        outstanding_down=outstanding_down,
+        clip_shares=clip_shares,
+    )
+    return {
+        "workingOrders": exposure,
+        "outstandingUp": round(outstanding_up, 6),
+        "outstandingDown": round(outstanding_down, 6),
+        "outstandingPairedQty": round(outstanding_paired, 6),
+        "outstandingResidualQty": round(outstanding_residual_qty, 6),
+        "outstandingResidualSide": outstanding_residual_side,
+        "projected": projected,
+    }
+
+
 def snapshot_quotes(
     *,
     up_book: dict[str, Any],
@@ -527,6 +609,8 @@ def snapshot_quotes(
 ) -> dict[str, Any]:
     up_bid = best_bid(up_book)
     down_bid = best_bid(down_book)
+    up_ask = best_ask(up_book)
+    down_ask = best_ask(down_book)
     up_depth = bid_depth_within_band(up_book, depth_band)
     down_depth = bid_depth_within_band(down_book, depth_band)
     quoted_up = None if up_bid is None else quote_price_from_bid(up_bid, bid_improve)
@@ -551,6 +635,8 @@ def snapshot_quotes(
         else {
             "bestBid": up_bid.price,
             "bestBidSize": up_bid.size,
+            "bestAsk": None if up_ask is None else up_ask.price,
+            "bestAskSize": None if up_ask is None else up_ask.size,
             "quotedPrice": quoted_up,
         },
         "down": None
@@ -558,6 +644,8 @@ def snapshot_quotes(
         else {
             "bestBid": down_bid.price,
             "bestBidSize": down_bid.size,
+            "bestAsk": None if down_ask is None else down_ask.price,
+            "bestAskSize": None if down_ask is None else down_ask.size,
             "quotedPrice": quoted_down,
         },
         "depth": {
@@ -596,6 +684,7 @@ def build_maker_paired_layers(
     maker_pair_threshold: float,
     maker_layer_size_ratio: float,
     remaining_action_slots: int,
+    include_base_layer: bool = False,
 ) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
     if (
@@ -614,8 +703,9 @@ def build_maker_paired_layers(
     for layer in range(1, maker_layers + 1):
         if remaining_action_slots - len(actions) < 2:
             break
-        up_price = round(max(0.01, up_base - maker_price_step * layer), 6)
-        down_price = round(max(0.01, down_base - maker_price_step * layer), 6)
+        step_offset = layer - 1 if include_base_layer else layer
+        up_price = round(max(0.01, up_base - maker_price_step * step_offset), 6)
+        down_price = round(max(0.01, down_base - maker_price_step * step_offset), 6)
         pair_cost = round(up_price + down_price, 6)
         if pair_cost > maker_pair_threshold:
             continue
@@ -783,10 +873,68 @@ def build_quote_context(
     }
 
 
+def near_touch_quote(base_quote: float, quote_row: dict[str, Any] | None) -> float:
+    if quote_row is None:
+        return base_quote
+    best_ask = quote_row.get("bestAsk")
+    candidate = base_quote + 0.01
+    if best_ask is not None:
+        candidate = min(candidate, float(best_ask) - 0.01)
+    candidate = round(max(base_quote, min(0.99, candidate)), 6)
+    if candidate <= base_quote + 1e-9:
+        return base_quote
+    return candidate
+
+
+def build_reference_like_anchor_pair(
+    *,
+    quotes: dict[str, Any],
+    up_quote: float,
+    down_quote: float,
+    pair_clip_size: float | None,
+    maker_pair_threshold: float,
+    remaining_action_slots: int,
+    enabled: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    if not enabled or pair_clip_size is None or remaining_action_slots < 2:
+        return [], None
+    anchor_up = near_touch_quote(up_quote, quotes.get("up"))
+    anchor_down = near_touch_quote(down_quote, quotes.get("down"))
+    anchor_cost = round(anchor_up + anchor_down, 6)
+    if anchor_cost > maker_pair_threshold:
+        return [], None
+    if abs(anchor_up - up_quote) < 1e-9 and abs(anchor_down - down_quote) < 1e-9:
+        return [], None
+    actions = [
+        {
+            "outcome": "Up",
+            "quotedPrice": anchor_up,
+            "size": pair_clip_size,
+            "mode": "maker_anchor",
+            "layer": 0,
+            "projectedPairCost": anchor_cost,
+        },
+        {
+            "outcome": "Down",
+            "quotedPrice": anchor_down,
+            "size": pair_clip_size,
+            "mode": "maker_anchor",
+            "layer": 0,
+            "projectedPairCost": anchor_cost,
+        },
+    ]
+    return actions, {
+        "upQuote": anchor_up,
+        "downQuote": anchor_down,
+        "pairQuotedCost": anchor_cost,
+    }
+
+
 def decide_actions(
     *,
     event: dict[str, Any],
     state: InventoryState,
+    session_context: dict[str, Any] | None,
     quotes: dict[str, Any],
     clip_shares: float,
     entry_threshold: float,
@@ -834,6 +982,13 @@ def decide_actions(
 
     residual_side = state.residual_side
     residual_qty = state.residual_qty
+    session_context = session_context or {}
+    outstanding_up = float(session_context.get("outstandingUp") or 0.0)
+    outstanding_down = float(session_context.get("outstandingDown") or 0.0)
+    outstanding_residual_qty = float(session_context.get("outstandingResidualQty") or 0.0)
+    projected = session_context.get("projected") or {}
+    projected_residual_qty = float(projected.get("residualQty") or residual_qty)
+    projected_residual_ratio = float(projected.get("residualRatio") or residual_ratio(state, clip_shares=clip_shares))
     quote_context = build_quote_context(
         quotes=quotes,
         state=state,
@@ -859,17 +1014,21 @@ def decide_actions(
     rebalance_cost = None
     can_rebalance = False
     rebalance_size = None
+    outstanding_lagging = 0.0
+    rebalance_needed_qty = residual_qty
     if lagging_side and lagging_quote is not None and lagging_avg is not None:
+        outstanding_lagging = outstanding_down if lagging_side == "Down" else outstanding_up
+        rebalance_needed_qty = max(0.0, residual_qty - outstanding_lagging)
         rebalance_cost = round(lagging_quote + lagging_avg, 6)
         rebalance_size = round_up_shares(
             max(
-                residual_qty,
+                rebalance_needed_qty,
                 VENUE_MIN_ORDER_SHARES,
                 min_order_notional / max(lagging_quote, 0.000001),
             )
         )
         can_rebalance = (
-            residual_qty > 0.01
+            rebalance_needed_qty > 0.01
             and rebalance_cost <= rebalance_threshold
             and rebalance_size <= max_clip_shares
         )
@@ -887,12 +1046,12 @@ def decide_actions(
 
     pair_clip_ok = pair_clip_size is not None and pair_clip_size <= max_clip_shares
     late_session_residual_guard = (
-        residual_qty >= max(0.0, late_session_residual_threshold)
+        projected_residual_qty >= max(0.0, late_session_residual_threshold)
         and remaining <= max(0, late_session_residual_seconds)
     )
-    session_ratio = float(quote_context["sessionResidualRatio"])
+    session_ratio = max(float(quote_context["sessionResidualRatio"]), projected_residual_ratio)
     session_paired_blocked = (
-        residual_qty >= max(0.0, session_residual_stop_shares)
+        projected_residual_qty >= max(0.0, session_residual_stop_shares)
         or session_ratio >= max(0.0, session_residual_stop_ratio)
     )
     total_seconds = event_total_seconds(event)
@@ -911,7 +1070,11 @@ def decide_actions(
         if early_session_active
         else max_actions_per_cycle
     )
-    available_pair_budget = max(0.0, effective_pair_budget_cap - residual_qty)
+    outstanding_residual_up = max(0.0, outstanding_up - outstanding_down)
+    outstanding_residual_down = max(0.0, outstanding_down - outstanding_up)
+    available_pair_budget_up = max(0.0, effective_pair_budget_cap - outstanding_residual_up)
+    available_pair_budget_down = max(0.0, effective_pair_budget_cap - outstanding_residual_down)
+    available_pair_budget = min(available_pair_budget_up, available_pair_budget_down)
     maker_rebalance_threshold = max(rebalance_threshold, maker_pair_threshold)
     maker_rebalance_actions: list[dict[str, Any]] = []
     if lagging_side and lagging_quote is not None and lagging_avg is not None:
@@ -919,7 +1082,7 @@ def decide_actions(
             lagging_side=lagging_side,
             lagging_avg=lagging_avg,
             lagging_quote=lagging_quote,
-            residual_qty=residual_qty,
+            residual_qty=rebalance_needed_qty,
             min_order_notional=min_order_notional,
             max_clip_shares=max_clip_shares,
             maker_layers=maker_layers,
@@ -927,6 +1090,27 @@ def decide_actions(
             maker_rebalance_threshold=maker_rebalance_threshold,
             remaining_action_slots=effective_max_actions,
         )
+    anchor_pair_enabled = (
+        not session_paired_blocked
+        and not late_session_residual_guard
+        and enough_depth
+        and pair_clip_ok
+        and pair_clip_size is not None
+        and pair_clip_size <= available_pair_budget + 1e-9
+        and residual_qty <= max_residual_shares + 1e-9
+    )
+    anchor_pair_actions, anchor_pair_context = build_reference_like_anchor_pair(
+        quotes=quotes,
+        up_quote=up_quote,
+        down_quote=down_quote,
+        pair_clip_size=pair_clip_size,
+        maker_pair_threshold=maker_pair_threshold,
+        remaining_action_slots=effective_max_actions,
+        enabled=anchor_pair_enabled,
+    )
+    maker_base_up = anchor_pair_context["upQuote"] if anchor_pair_context else up_quote
+    maker_base_down = anchor_pair_context["downQuote"] if anchor_pair_context else down_quote
+    maker_layers_effective = 1 if anchor_pair_actions else maker_layers
 
     if residual_qty >= max_residual_shares:
         if can_rebalance:
@@ -988,61 +1172,76 @@ def decide_actions(
                     },
                 ]
             )
+            remaining_slots = max(0, effective_max_actions - len(decisions))
+            anchor_actions_for_pair = anchor_pair_actions[:remaining_slots]
+            if anchor_actions_for_pair:
+                decisions.extend(anchor_actions_for_pair)
             maker_pair_actions = cap_actions_by_outcome_budget(
                 build_maker_paired_layers(
-                    up_base=up_quote,
-                    down_base=down_quote,
+                    up_base=maker_base_up,
+                    down_base=maker_base_down,
                     clip_shares=clip_shares,
                     min_order_notional=min_order_notional,
                     max_clip_shares=max_clip_shares,
-                    maker_layers=maker_layers,
+                    maker_layers=maker_layers_effective,
                     maker_price_step=maker_price_step,
                     maker_pair_threshold=maker_pair_threshold,
                     maker_layer_size_ratio=maker_layer_size_ratio,
                     remaining_action_slots=max(0, effective_max_actions - len(decisions)),
+                    include_base_layer=False,
                 ),
-                per_outcome_budget=max(0.0, available_pair_budget - pair_clip_size),
+                per_outcome_budget=max(
+                    0.0,
+                    available_pair_budget
+                    - pair_clip_size
+                    - (pair_clip_size if anchor_actions_for_pair else 0.0),
+                ),
             )
             if maker_pair_actions:
                 decisions.extend(maker_pair_actions)
-                reason = "hybrid_paired_maker"
+                reason = "hybrid_paired_anchor_maker" if anchor_actions_for_pair else "hybrid_paired_maker"
+            elif anchor_actions_for_pair:
+                reason = "reference_like_anchor_pair"
             else:
                 reason = "paired_bid_edge"
         elif (
             pair_cost is not None
             and enough_depth
             and build_maker_paired_layers(
-                up_base=up_quote,
-                down_base=down_quote,
+                up_base=maker_base_up,
+                down_base=maker_base_down,
                 clip_shares=clip_shares,
                 min_order_notional=min_order_notional,
                 max_clip_shares=max_clip_shares,
-                maker_layers=maker_layers,
+                maker_layers=maker_layers_effective,
                 maker_price_step=maker_price_step,
                 maker_pair_threshold=maker_pair_threshold,
                 maker_layer_size_ratio=maker_layer_size_ratio,
                 remaining_action_slots=effective_max_actions,
+                include_base_layer=not anchor_pair_actions,
             )
         ):
             decisions.extend(
                 cap_actions_by_outcome_budget(
-                    build_maker_paired_layers(
-                        up_base=up_quote,
-                        down_base=down_quote,
+                    anchor_pair_actions
+                    + build_maker_paired_layers(
+                        up_base=maker_base_up,
+                        down_base=maker_base_down,
                         clip_shares=clip_shares,
                         min_order_notional=min_order_notional,
                         max_clip_shares=max_clip_shares,
-                        maker_layers=maker_layers,
+                        maker_layers=maker_layers_effective,
                         maker_price_step=maker_price_step,
                         maker_pair_threshold=maker_pair_threshold,
                         maker_layer_size_ratio=maker_layer_size_ratio,
                         remaining_action_slots=effective_max_actions,
+                        include_base_layer=not anchor_pair_actions,
                     ),
                     per_outcome_budget=available_pair_budget,
                 )
             )
             reason = (
-                "maker_paired_ladder"
+                "reference_like_maker_ladder"
                 if decisions
                 else "session_pair_budget_exhausted"
             )
@@ -1067,11 +1266,25 @@ def decide_actions(
         "rebalanceClipSize": rebalance_size,
         "lateSessionResidualGuard": late_session_residual_guard,
         "sessionResidualRatio": round(session_ratio, 6),
+        "outstandingExposure": {
+            "up": round(outstanding_up, 6),
+            "down": round(outstanding_down, 6),
+            "residualQty": round(outstanding_residual_qty, 6),
+        },
+        "projectedResidualQty": round(projected_residual_qty, 6),
+        "projectedResidualRatio": round(projected_residual_ratio, 6),
         "sessionPairedBlocked": session_paired_blocked,
         "sessionAvailablePairBudget": round(available_pair_budget, 6),
+        "sessionAvailablePairBudgetByOutcome": {
+            "up": round(available_pair_budget_up, 6),
+            "down": round(available_pair_budget_down, 6),
+        },
         "effectivePairBudgetCap": round(effective_pair_budget_cap, 6),
         "effectiveMaxActions": effective_max_actions,
         "earlySessionActive": early_session_active,
+        "anchorPairEnabled": anchor_pair_enabled,
+        "effectiveMakerLayers": maker_layers_effective,
+        "anchorPairContext": anchor_pair_context,
         "quoteContext": quote_context,
     }
 
@@ -1391,6 +1604,7 @@ def main() -> int:
             "residualWatchSeconds": args.residual_watch_seconds,
             "pollSeconds": args.poll_seconds,
             "restSeconds": args.rest_seconds,
+            "sessionOrderTtlSeconds": None,
             "bidImprove": args.bid_improve,
             "depthBand": args.depth_band,
             "minDepthRatio": args.min_depth_ratio,
@@ -1441,16 +1655,52 @@ def main() -> int:
     )
     cycle_index = 0
     last_execution_wall_time: float | None = None
+    session_open_orders: list[WorkingOrder] = []
+    seen_fill_hashes: set[str] = set()
+    session_order_ttl = max(
+        15.0,
+        args.poll_seconds * 6.0,
+        (args.rest_seconds if args.live_ok else 0.0) + args.poll_seconds + 1.0,
+    )
+    summary["parameters"]["sessionOrderTtlSeconds"] = round(session_order_ttl, 3)
 
     while time.time() < deadline:
         cycle_index += 1
+        now_ts = time.time()
+        session_open_orders = prune_expired_orders(session_open_orders, now_ts)
         market_books = RestPollingMarketFeed().fetch_event_books(event)
         fills = fetch_wallet_trades(
             wallet=wallet_address,
             slug=event["slug"],
             since_timestamp=start_timestamp,
         )
-        state = compute_inventory_state(merge_fills(fills, inferred_fills))
+        merged_cycle_fills = merge_fills(fills, inferred_fills)
+        new_fill_rows = []
+        for fill in merged_cycle_fills:
+            if fill.transaction_hash in seen_fill_hashes:
+                continue
+            seen_fill_hashes.add(fill.transaction_hash)
+            new_fill_rows.append(
+                {
+                    "outcome": fill.outcome,
+                    "size": fill.size,
+                    "price": fill.price,
+                    "timestamp": fill.timestamp,
+                    "transactionHash": fill.transaction_hash,
+                }
+            )
+        session_open_orders = consume_working_order_fills(
+            session_open_orders,
+            new_fill_rows,
+            now_ts=now_ts,
+        )
+        state = compute_inventory_state(merged_cycle_fills)
+        session_context = session_risk_context(
+            state=state,
+            working_orders=session_open_orders,
+            clip_shares=args.clip_shares,
+            now_ts=now_ts,
+        )
         quotes = snapshot_quotes(
             up_book=market_books.up_book,
             down_book=market_books.down_book,
@@ -1463,6 +1713,7 @@ def main() -> int:
         decision = decide_actions(
             event=event,
             state=state,
+            session_context=session_context,
             quotes=quotes,
             clip_shares=args.clip_shares,
             entry_threshold=args.entry_threshold,
@@ -1504,10 +1755,29 @@ def main() -> int:
             "timestampUtc": datetime.now(timezone.utc).isoformat(),
             "secondsLeft": decision["secondsLeft"],
             "inventory": state.to_dict(),
+            "sessionRiskBeforeDecision": session_context,
             "quotes": quotes,
             "decision": decision,
             "targetLadder": ladder_summary(decision["actions"]),
+            "workingOrdersBeforeCycle": [row.to_dict() for row in session_open_orders],
         }
+
+        session_open_orders, ladder_reconcile = reconcile_orders(
+            existing_orders=session_open_orders,
+            actions=decision["actions"],
+            now_ts=now_ts,
+            ttl_seconds=session_order_ttl,
+            cycle_index=cycle_index,
+            slug=event["slug"],
+        )
+        cycle["ladderReconcile"] = ladder_reconcile
+        cycle["workingOrdersAfterDecision"] = [row.to_dict() for row in session_open_orders]
+        cycle["sessionRiskAfterDecision"] = session_risk_context(
+            state=state,
+            working_orders=session_open_orders,
+            clip_shares=args.clip_shares,
+            now_ts=now_ts,
+        )
 
         cycle_state = state
         if args.live_ok and decision["actions"]:
@@ -1573,6 +1843,8 @@ def main() -> int:
                 merge_fills(cycle_fills, inferred_fills)
             )
             cycle["postExecutionInventory"] = cycle_state.to_dict()
+            session_open_orders = []
+            cycle["workingOrdersAfterCleanup"] = []
         else:
             summary["cycles"].append(cycle)
 
