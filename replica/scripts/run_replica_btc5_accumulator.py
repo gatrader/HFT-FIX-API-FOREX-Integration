@@ -147,6 +147,43 @@ def event_total_seconds(event: dict[str, Any]) -> int | None:
     return max(0, int(round(end_ts - start_ts)))
 
 
+def compute_session_phase(
+    seconds_left: int | None,
+    *,
+    total_seconds: int | None,
+    early_phase_seconds: int,
+    late_phase_seconds: int,
+    flatten_phase_seconds: int,
+) -> str:
+    """Map seconds-left to one of early / mid / late / flatten.
+
+    Milestone 2 — the spec §"Time-State Modes" asks for explicit
+    phase tracking so the planner (and later the measurement report)
+    can reason about "what mode are we in" without re-deriving it
+    from N overlapping boolean gates.
+
+    Boundaries (for a 300s BTC5 window with defaults):
+      - seconds_left < 60                 → flatten
+      - 60 <= seconds_left < 120          → late
+      - 120 <= seconds_left < 180         → mid
+      - seconds_left >= 180               → early
+    """
+    if seconds_left is None:
+        return "unknown"
+    remaining = int(seconds_left)
+    if remaining <= max(0, int(flatten_phase_seconds)):
+        return "flatten"
+    if remaining <= max(0, int(late_phase_seconds)):
+        return "late"
+    if total_seconds is None:
+        # Without a known total we can't tell early from mid; keep
+        # "mid" as the safe default so no phase-only branch fires.
+        return "mid"
+    if remaining >= max(0, int(total_seconds) - max(0, int(early_phase_seconds))):
+        return "early"
+    return "mid"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -404,6 +441,50 @@ def build_parser() -> argparse.ArgumentParser:
             "If > 0, clip any new order that would push projected "
             "post-fill residual (filled + all outstanding) past this "
             "many shares. 0 disables the check (current behavior)."
+        ),
+    )
+    # Milestone 2 — price-band hysteresis for reconcile_orders and
+    # explicit session-phase boundaries.
+    parser.add_argument(
+        "--quote-price-band-ticks",
+        type=int,
+        default=0,
+        help=(
+            "Reconcile tolerance in venue ticks (0.01 each). When > 0, "
+            "an existing order whose target price drifted by at most "
+            "this many ticks is classified preserved (no re-anchor), "
+            "not amended. This is the primary M2 persistence knob."
+        ),
+    )
+    parser.add_argument(
+        "--quote-size-band-shares",
+        type=float,
+        default=0.0,
+        help=(
+            "Reconcile size tolerance in shares. A working order whose "
+            "target size drifts within this many shares of current "
+            "remains preserved instead of amended."
+        ),
+    )
+    parser.add_argument(
+        "--late-phase-seconds",
+        type=int,
+        default=120,
+        help=(
+            "Seconds-left boundary below which the window is in the "
+            "late phase (but above the flatten boundary). Purely "
+            "observational right now; future milestones may gate "
+            "aggressiveness on it."
+        ),
+    )
+    parser.add_argument(
+        "--flatten-phase-seconds",
+        type=int,
+        default=60,
+        help=(
+            "Seconds-left boundary below which the window is in the "
+            "flatten phase. While in flatten, the pair budget is "
+            "clamped to zero so no new paired expansion occurs."
         ),
     )
     return parser
@@ -851,10 +932,20 @@ def decide_actions(
     outstanding_up: float = 0.0,
     outstanding_down: float = 0.0,
     projected_exposure_limit_shares: float = 0.0,
+    late_phase_seconds: int = 120,
+    flatten_phase_seconds: int = 60,
 ) -> dict[str, Any]:
     remaining = seconds_left(event)
     decisions: list[dict[str, Any]] = []
     reason = "hold"
+    total_seconds_window = event_total_seconds(event)
+    session_phase = compute_session_phase(
+        remaining,
+        total_seconds=total_seconds_window,
+        early_phase_seconds=early_session_seconds,
+        late_phase_seconds=late_phase_seconds,
+        flatten_phase_seconds=flatten_phase_seconds,
+    )
     pair_cost = quotes.get("pairQuotedCost")
     enough_depth = quotes.get("enoughDepth", False)
     enough_best_level = quotes.get("enoughBestLevel", False)
@@ -953,6 +1044,13 @@ def decide_actions(
         else max_actions_per_cycle
     )
     available_pair_budget = max(0.0, effective_pair_budget_cap - residual_qty)
+    # Milestone 2 — in the flatten phase the spec §"Flatten" rules
+    # out new paired expansion. Setting the pair budget to zero is
+    # the single choke point that blocks both the paired-entry
+    # branch and the maker-paired ladder branch below, without
+    # touching existing guards so the residual flow stays intact.
+    if session_phase == "flatten":
+        available_pair_budget = 0.0
     maker_rebalance_threshold = max(rebalance_threshold, maker_pair_threshold)
     maker_rebalance_actions: list[dict[str, Any]] = []
     if lagging_side and lagging_quote is not None and lagging_avg is not None:
@@ -1166,6 +1264,13 @@ def decide_actions(
         "effectivePairBudgetCap": round(effective_pair_budget_cap, 6),
         "effectiveMaxActions": effective_max_actions,
         "earlySessionActive": early_session_active,
+        "sessionPhase": session_phase,
+        "phaseBoundaries": {
+            "earlyPhaseSeconds": int(early_session_seconds),
+            "latePhaseSeconds": int(late_phase_seconds),
+            "flattenPhaseSeconds": int(flatten_phase_seconds),
+            "totalSeconds": total_seconds_window,
+        },
         "quoteContext": quote_context,
         "outstandingExposure": {
             "Up": round(pre_clip_up, 6),
@@ -1320,6 +1425,8 @@ def run_cycle_actions(
     persistent_ladder: bool = False,
     existing_working_orders: list[WorkingOrder] | None = None,
     ladder_ttl_seconds: float = 30.0,
+    reconcile_price_band: float = 0.0,
+    reconcile_size_band: float = 0.0,
 ) -> dict[str, Any]:
     fee_rate_bps = int(event.get("makerBaseFee") or 0)
     cycle_tag = f"{stamp}.cycle{cycle_index:03d}"
@@ -1360,6 +1467,8 @@ def run_cycle_actions(
             ttl_seconds=ladder_ttl_seconds,
             cycle_index=cycle_index,
             slug=event["slug"],
+            price_band=reconcile_price_band,
+            size_band=reconcile_size_band,
         )
         # Only the actions the reconciler classified as created or
         # amended get submitted this cycle. Preserved orders stay
@@ -1561,6 +1670,10 @@ def main() -> int:
             "projectedExposureLimitShares": float(
                 args.projected_exposure_limit_shares
             ),
+            "quotePriceBandTicks": int(args.quote_price_band_ticks),
+            "quoteSizeBandShares": float(args.quote_size_band_shares),
+            "latePhaseSeconds": int(args.late_phase_seconds),
+            "flattenPhaseSeconds": int(args.flatten_phase_seconds),
             "watchSeconds": args.watch_seconds,
             "residualWatchSeconds": args.residual_watch_seconds,
             "pollSeconds": args.poll_seconds,
@@ -1671,6 +1784,8 @@ def main() -> int:
             outstanding_up=outstanding.get("Up", 0.0),
             outstanding_down=outstanding.get("Down", 0.0),
             projected_exposure_limit_shares=args.projected_exposure_limit_shares,
+            late_phase_seconds=args.late_phase_seconds,
+            flatten_phase_seconds=args.flatten_phase_seconds,
         )
 
         pair_quote = quotes.get("pairQuotedCost")
@@ -1716,6 +1831,8 @@ def main() -> int:
                 persistent_ladder=args.persistent_ladder,
                 existing_working_orders=session_working_orders,
                 ladder_ttl_seconds=args.ladder_ttl_seconds,
+                reconcile_price_band=float(args.quote_price_band_ticks) * 0.01,
+                reconcile_size_band=float(args.quote_size_band_shares),
             )
             cycle["execution"] = execution
             if args.persistent_ladder:

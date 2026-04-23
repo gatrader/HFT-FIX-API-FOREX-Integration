@@ -129,7 +129,22 @@ def reconcile_orders(
     ttl_seconds: float,
     cycle_index: int,
     slug: str,
+    price_band: float = 0.0,
+    size_band: float = 0.0,
 ) -> tuple[list[WorkingOrder], dict[str, Any]]:
+    """Diff working orders against target intents.
+
+    ``price_band`` / ``size_band`` are hysteresis tolerances. When the
+    incoming intent drifts within this band of the current order,
+    that order is classified as ``preserved`` and its price / size are
+    not updated — this is what keeps queue position across cycles.
+    Outside the band the order is ``amended``: price / size rewritten
+    to the new intent values so subsequent cycles re-align.
+
+    Milestone 2 — the reconciler's amended-vs-preserved decision is
+    now the knob that controls ladder stability, not a hard-coded
+    1e-9 exact match.
+    """
     existing_orders = prune_expired_orders(existing_orders, now_ts)
     existing_by_key = {order.key: order for order in existing_orders}
     target_intents = [ladder_intent_from_action(action) for action in actions]
@@ -175,17 +190,42 @@ def reconcile_orders(
             created.append(new_order.to_dict())
             continue
 
-        changed = abs(current.price - intent.price) > 1e-9 or abs(current.size - intent.size) > 1e-9
-        current.price = intent.price
-        current.size = intent.size
-        current.remaining_size = min(current.remaining_size, intent.size)
-        current.updated_timestamp = now_ts
-        current.expires_timestamp = now_ts + max(0.0, ttl_seconds)
-        next_orders.append(current)
-        if changed:
-            amended.append(current.to_dict())
+        price_drift = abs(current.price - intent.price)
+        size_drift = abs(current.size - intent.size)
+        price_eff_band = max(1e-9, float(price_band))
+        size_eff_band = max(1e-9, float(size_band))
+        # Preserved when the incoming intent drifted INSIDE the band.
+        # Both price and size must fit in the band — otherwise we
+        # have to re-anchor and it's an amend. Tolerance epsilon
+        # absorbs the IEEE-754 noise from 0.51-0.50 ≠ 0.01 exactly.
+        cmp_eps = 1e-9
+        preserve = (
+            price_drift <= price_eff_band + cmp_eps
+            and size_drift <= size_eff_band + cmp_eps
+        )
+        anchor_residency = {
+            "priceDrift": round(price_drift, 6),
+            "sizeDrift": round(size_drift, 6),
+            "priceBand": round(float(price_band), 6),
+            "sizeBand": round(float(size_band), 6),
+        }
+        if preserve:
+            # Do NOT rewrite price/size — preserving queue position
+            # is the whole point of the band. Refresh TTL so target
+            # orders don't age out mid-session.
+            current.remaining_size = min(current.remaining_size, current.size)
+            current.updated_timestamp = now_ts
+            current.expires_timestamp = now_ts + max(0.0, ttl_seconds)
+            next_orders.append(current)
+            preserved.append({**current.to_dict(), **anchor_residency})
         else:
-            preserved.append(current.to_dict())
+            current.price = intent.price
+            current.size = intent.size
+            current.remaining_size = min(current.remaining_size, intent.size)
+            current.updated_timestamp = now_ts
+            current.expires_timestamp = now_ts + max(0.0, ttl_seconds)
+            next_orders.append(current)
+            amended.append({**current.to_dict(), **anchor_residency})
 
     next_orders.sort(key=lambda order: (order.outcome, order.mode, order.layer, order.price))
     return next_orders, {
@@ -194,4 +234,8 @@ def reconcile_orders(
         "preserved": preserved,
         "cancelled": cancelled,
         "targetSummary": ladder_summary(actions),
+        "bands": {
+            "priceBand": round(float(price_band), 6),
+            "sizeBand": round(float(size_band), 6),
+        },
     }

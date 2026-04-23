@@ -133,6 +133,11 @@ def add_strategy_args(parser: argparse.ArgumentParser) -> None:
             "past this many shares. Mirrors the accumulator knob."
         ),
     )
+    # Milestone 2 mirrors — price-band hysteresis + phase boundaries.
+    parser.add_argument("--quote-price-band-ticks", type=int, default=0)
+    parser.add_argument("--quote-size-band-shares", type=float, default=0.0)
+    parser.add_argument("--late-phase-seconds", type=int, default=120)
+    parser.add_argument("--flatten-phase-seconds", type=int, default=60)
     parser.add_argument("--bid-improve", type=float, default=0.0)
     parser.add_argument("--depth-band", type=float, default=0.02)
     parser.add_argument("--min-depth-ratio", type=float, default=1.5)
@@ -850,6 +855,8 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
         outstanding_up=outstanding_shadow.get("Up", 0.0),
         outstanding_down=outstanding_shadow.get("Down", 0.0),
         projected_exposure_limit_shares=args.projected_exposure_limit_shares,
+        late_phase_seconds=args.late_phase_seconds,
+        flatten_phase_seconds=args.flatten_phase_seconds,
     )
     # Milestone 1 — cycle-level risk metrics. These match the spec's
     # "metrics to track" list so parameter sweeps can be scored on
@@ -883,6 +890,13 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
             "qty": round(projected_qty, 6),
         },
         "exposureClipCount": len(decision.get("exposureClips") or []),
+        # Milestone 2 — explicit session phase + band configuration
+        # so per-cycle records carry their own provenance and the
+        # measurement report can slice by phase / band without
+        # re-deriving from the run parameters.
+        "sessionPhase": decision.get("sessionPhase"),
+        "priceBandTicks": int(args.quote_price_band_ticks),
+        "sizeBandShares": float(args.quote_size_band_shares),
     }
     warnings = [warning for warning in (reference_warning, market_warning) if warning]
     if warnings:
@@ -909,6 +923,8 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
             ttl_seconds=args.shadow_order_ttl_seconds,
             cycle_index=cycle_index,
             slug=event["slug"],
+            price_band=float(args.quote_price_band_ticks) * 0.01,
+            size_band=float(args.quote_size_band_shares),
         )
         cycle["targetLadder"] = ladder_summary(decision["actions"])
         cycle["ladderReconcile"] = reconcile_summary
