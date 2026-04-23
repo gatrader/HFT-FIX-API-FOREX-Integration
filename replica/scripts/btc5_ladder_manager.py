@@ -156,8 +156,33 @@ def reconcile_orders(
     cancelled: list[dict[str, Any]] = []
 
     target_keys = {intent.key for intent in target_intents}
+    # Milestone 2b — contextualize cancels so the measurement report
+    # can distinguish "planner produced no targets this cycle"
+    # (likely a phase transition or mode flip) from "planner kept
+    # targets on the other side but not this specific key" (likely
+    # a layer-depth adjustment or inventory skew). Raw
+    # "not_in_target_ladder" lumped all those together and hid the
+    # real churn driver.
+    target_modes = {intent.mode for intent in target_intents}
+    target_outcomes_in_mode: dict[str, set[str]] = {}
+    for intent in target_intents:
+        target_outcomes_in_mode.setdefault(intent.mode, set()).add(intent.outcome)
+    empty_target = not target_intents
     for order in existing_orders:
         if order.key not in target_keys:
+            if empty_target:
+                reason = "target_ladder_empty"
+            elif order.mode not in target_modes:
+                # The whole class of orders (e.g. "paired") vanished
+                # from target — strategy mode flipped (paired→flatten
+                # or paired→rebalance).
+                reason = "mode_not_in_target"
+            elif order.outcome not in target_outcomes_in_mode.get(order.mode, set()):
+                reason = "outcome_dropped_in_mode"
+            else:
+                # Same mode + outcome present, but this specific
+                # layer key isn't — layer depth changed.
+                reason = "layer_dropped"
             cancelled.append(
                 {
                     "orderId": order.order_id,
@@ -166,7 +191,7 @@ def reconcile_orders(
                     "mode": order.mode,
                     "remainingSize": round(order.remaining_size, 6),
                     "price": round(order.price, 6),
-                    "reason": "not_in_target_ladder",
+                    "reason": reason,
                 }
             )
 
@@ -228,11 +253,16 @@ def reconcile_orders(
             amended.append({**current.to_dict(), **anchor_residency})
 
     next_orders.sort(key=lambda order: (order.outcome, order.mode, order.layer, order.price))
+    cancel_reason_counts: dict[str, int] = {}
+    for row in cancelled:
+        r = row.get("reason") or "unknown"
+        cancel_reason_counts[r] = cancel_reason_counts.get(r, 0) + 1
     return next_orders, {
         "created": created,
         "amended": amended,
         "preserved": preserved,
         "cancelled": cancelled,
+        "cancelReasonCounts": cancel_reason_counts,
         "targetSummary": ladder_summary(actions),
         "bands": {
             "priceBand": round(float(price_band), 6),
