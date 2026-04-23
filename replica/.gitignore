@@ -2,3 +2,5 @@ target/
 Cargo.lock
 .nonce
 .replica/
+.generated/
+__pycache__/
