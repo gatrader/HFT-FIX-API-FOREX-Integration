@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Arbigab · replica ops</title>
+  <link rel="icon" href="/static/logo_gabagool.png" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body class="min-h-screen">
+  <header>
+    <div class="brand">
+      <img src="/static/logo_gabagool.png" alt="Arbigab" />
+      <h1>Arbigab<span class="sub">replica ops</span></h1>
+    </div>
+    <div class="meta">
+      <span id="host">host —</span>
+      <span id="branch">branch —</span>
+      <span id="commit">commit —</span>
+      <span id="mode" class="mode">mode —</span>
+      <span id="run-state" class="pill idle">idle</span>
+      <span id="server-time" class="muted">—</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="cards">
+      <div class="card" id="card-ws">
+        <div class="label">user-ws</div>
+        <div class="value" id="ws-value">—</div>
+        <div class="sub" id="ws-sub"></div>
+      </div>
+      <div class="card" id="card-submit">
+        <div class="label">last submit</div>
+        <div class="value" id="submit-value">—</div>
+      </div>
+      <div class="card" id="card-fill">
+        <div class="label">last fill</div>
+        <div class="value" id="fill-value">—</div>
+      </div>
+      <div class="card" id="card-reject">
+        <div class="label">last reject</div>
+        <div class="value" id="reject-value">—</div>
+      </div>
+      <div class="card" id="card-cancel">
+        <div class="label">last cancel-all</div>
+        <div class="value" id="cancel-value">—</div>
+      </div>
+      <div class="card" id="card-duration">
+        <div class="label">duration reached</div>
+        <div class="value" id="duration-value">—</div>
+      </div>
+    </section>
+
+    <section class="actions">
+      <div class="action-header">actions</div>
+      <button data-slug="paper"     class="btn">paper run</button>
+      <button data-slug="live5m"    class="btn live" data-confirm="Launch live 5-minute run? Real orders will be placed.">live 5m</button>
+      <button data-slug="userws30s" class="btn">user-ws 30s</button>
+      <button data-slug="cleanup"   class="btn warn" data-confirm="Run cleanup? This cancels all open orders on the venue.">cleanup</button>
+      <button id="stop-btn" class="btn warn" data-confirm="Stop the running job?" disabled>stop</button>
+      <span id="action-status" class="muted"></span>
+    </section>
+
+    <section class="layout">
+      <section class="logs">
+        <div class="log-header">
+          <span>log viewer</span>
+          <span class="muted" id="log-path">—</span>
+        </div>
+        <div class="filters" id="filters"></div>
+        <pre id="log" class="log-pane">(waiting for a job)</pre>
+      </section>
+
+      <aside class="jobs">
+        <div class="jobs-header">
+          <span>recent jobs</span>
+          <span class="muted" id="jobs-count">0</span>
+        </div>
+        <ul id="jobs-list" class="jobs-list"></ul>
+      </aside>
+    </section>
+  </main>
+
+  <footer class="muted">
+    polling every 2s · /healthz · single-operator tool · bind 127.0.0.1 only
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
