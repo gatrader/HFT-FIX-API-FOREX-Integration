@@ -81,6 +81,46 @@ def prune_expired_orders(orders: list[WorkingOrder], now_ts: float) -> list[Work
     ]
 
 
+def compute_outstanding_exposure(
+    orders: list[WorkingOrder],
+) -> dict[str, float]:
+    """Sum remaining_size per outcome across working orders.
+
+    Returns a dict with at least ``Up`` and ``Down`` keys so callers
+    can rely on shape without branching. An empty working-orders list
+    returns zeros, not missing keys.
+    """
+    exposure: dict[str, float] = {"Up": 0.0, "Down": 0.0}
+    for order in orders:
+        exposure[order.outcome] = (
+            exposure.get(order.outcome, 0.0) + float(order.remaining_size)
+        )
+    return exposure
+
+
+def project_residual_if_all_fill(
+    *,
+    filled_up: float,
+    filled_down: float,
+    outstanding_up: float,
+    outstanding_down: float,
+) -> tuple[str | None, float]:
+    """Residual side + qty if every outstanding order fills.
+
+    The spec treats outstanding orders as real risk: this pair shape
+    makes that risk first-class. Used both as a pre-submit gate
+    (``decide_actions`` exposure clip) and as a cycle-level metric
+    (``projectedResidual`` in shadow output).
+    """
+    projected_up = max(0.0, float(filled_up) + float(outstanding_up))
+    projected_down = max(0.0, float(filled_down) + float(outstanding_down))
+    if projected_up > projected_down + 1e-9:
+        return ("Up", projected_up - projected_down)
+    if projected_down > projected_up + 1e-9:
+        return ("Down", projected_down - projected_up)
+    return (None, 0.0)
+
+
 def reconcile_orders(
     *,
     existing_orders: list[WorkingOrder],
