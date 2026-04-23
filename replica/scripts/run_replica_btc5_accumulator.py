@@ -12,7 +12,13 @@ from typing import Any
 
 import requests
 
-from btc5_ladder_manager import ladder_summary
+from btc5_ladder_manager import (
+    WorkingOrder,
+    compute_outstanding_exposure,
+    ladder_summary,
+    project_residual_if_all_fill,
+    reconcile_orders,
+)
 from btc5_market_feed import RestPollingMarketFeed
 from resolve_next_btc5 import resolve
 from run_replica_btc5_paired import (
@@ -367,6 +373,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--live-ok",
         action="store_true",
         help="Actually place live orders. Omit for a dry-run forensic pass.",
+    )
+    # Milestone 1 — persistent-ladder + exposure-as-risk flags.
+    # Both default off so existing behavior is preserved; validation
+    # is done in paper/shadow mode (btc5_shadow_reference.py) first.
+    parser.add_argument(
+        "--persistent-ladder",
+        action="store_true",
+        help=(
+            "Skip per-cycle cleanup_cancel_all and reconcile the working "
+            "ladder against the target ladder instead. Preserves queue "
+            "position for orders still in the target set."
+        ),
+    )
+    parser.add_argument(
+        "--ladder-ttl-seconds",
+        type=float,
+        default=30.0,
+        help=(
+            "Target-ladder TTL used by reconcile_orders when "
+            "--persistent-ladder is on. Longer TTL = longer average "
+            "order lifetime = more queue persistence."
+        ),
+    )
+    parser.add_argument(
+        "--projected-exposure-limit-shares",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, clip any new order that would push projected "
+            "post-fill residual (filled + all outstanding) past this "
+            "many shares. 0 disables the check (current behavior)."
+        ),
     )
     return parser
 
@@ -810,6 +848,9 @@ def decide_actions(
     maker_pair_threshold: float,
     maker_layer_size_ratio: float,
     max_actions_per_cycle: int,
+    outstanding_up: float = 0.0,
+    outstanding_down: float = 0.0,
+    projected_exposure_limit_shares: float = 0.0,
 ) -> dict[str, Any]:
     remaining = seconds_left(event)
     decisions: list[dict[str, Any]] = []
@@ -1057,6 +1098,59 @@ def decide_actions(
         elif pair_cost is not None and pair_cost > entry_threshold:
             reason = "no_bid_edge_after_threshold"
 
+    # Milestone 1 — treat outstanding orders as real risk.
+    # After the existing decision logic has proposed an action list,
+    # walk it in order and clip any create that would push the
+    # projected post-fill residual past the configured shares limit.
+    # Defaults preserve current behavior: when the caller passes the
+    # zero defaults for outstanding/limit, this loop is a no-op.
+    pre_clip_up, pre_clip_down = outstanding_up, outstanding_down
+    base_projected_side, base_projected_qty = project_residual_if_all_fill(
+        filled_up=state.up_qty,
+        filled_down=state.down_qty,
+        outstanding_up=outstanding_up,
+        outstanding_down=outstanding_down,
+    )
+    exposure_clips: list[dict[str, Any]] = []
+    if projected_exposure_limit_shares > 0.0 and decisions:
+        allowed: list[dict[str, Any]] = []
+        # Cumulative size added by already-allowed actions this cycle,
+        # keyed by outcome. The exposure check treats outstanding +
+        # cumulative-allowed as the floor for the next decision.
+        cum: dict[str, float] = {"Up": 0.0, "Down": 0.0}
+        for action in decisions:
+            outcome = str(action.get("outcome") or "")
+            size = float(action.get("size") or 0.0)
+            proj_up = state.up_qty + outstanding_up + cum["Up"] + (
+                size if outcome == "Up" else 0.0
+            )
+            proj_down = state.down_qty + outstanding_down + cum["Down"] + (
+                size if outcome == "Down" else 0.0
+            )
+            proj_qty = abs(proj_up - proj_down)
+            if proj_qty > projected_exposure_limit_shares + 1e-9:
+                exposure_clips.append(
+                    {
+                        "outcome": outcome,
+                        "size": round(size, 6),
+                        "mode": str(action.get("mode") or ""),
+                        "layer": int(action.get("layer") or 0),
+                        "projectedResidualQty": round(proj_qty, 6),
+                        "limit": round(
+                            float(projected_exposure_limit_shares), 6
+                        ),
+                        "reason": "projected_exposure_limit",
+                    }
+                )
+                continue
+            allowed.append(action)
+            if outcome in cum:
+                cum[outcome] += size
+        if exposure_clips:
+            decisions = allowed
+            if not decisions:
+                reason = "exposure_projection_blocked"
+
     return {
         "secondsLeft": remaining,
         "reason": reason,
@@ -1073,6 +1167,16 @@ def decide_actions(
         "effectiveMaxActions": effective_max_actions,
         "earlySessionActive": early_session_active,
         "quoteContext": quote_context,
+        "outstandingExposure": {
+            "Up": round(pre_clip_up, 6),
+            "Down": round(pre_clip_down, 6),
+        },
+        "projectedResidual": {
+            "side": base_projected_side,
+            "qty": round(base_projected_qty, 6),
+            "limitShares": round(float(projected_exposure_limit_shares), 6),
+        },
+        "exposureClips": exposure_clips,
     }
 
 
@@ -1213,6 +1317,9 @@ def run_cycle_actions(
     symbol_prefix: str,
     stamp: str,
     cycle_index: int,
+    persistent_ladder: bool = False,
+    existing_working_orders: list[WorkingOrder] | None = None,
+    ladder_ttl_seconds: float = 30.0,
 ) -> dict[str, Any]:
     fee_rate_bps = int(event.get("makerBaseFee") or 0)
     cycle_tag = f"{stamp}.cycle{cycle_index:03d}"
@@ -1230,23 +1337,74 @@ def run_cycle_actions(
         trade_side="buy_only",
     )
 
-    pre_cleanup = cleanup_cancel_all(
-        binary=binary,
-        creds=creds,
-        nonce=nonce,
-        private_key=private_key,
-        signature_type=signature_type,
-        funder=funder,
-        config_path=cleanup_plan.config_path,
-        token_id=event["upTokenId"],
-        market_id=event["conditionId"],
-        fee_rate_bps=fee_rate_bps,
-        log_path=output_dir / f"{event['slug']}.{cycle_tag}.pre-cleanup.log",
-    )
+    # Milestone 1 — persistent-ladder mode. When enabled, skip the
+    # per-cycle cleanup_cancel_all and instead reconcile the existing
+    # working orders against the proposed action list. Only the delta
+    # (created + amended) is submitted; cancelled keys are batched for
+    # an end-of-cycle targeted cancel. `preserved` orders stay on the
+    # book untouched, which is the whole point — preserving queue
+    # position is how we move toward the reference wallet's tempo.
+    #
+    # This path is flag-gated and shadow is where we validate; the
+    # live accumulator keeps its existing cleanup-first flow by
+    # default so no live behavior changes until the operator opts in.
+    reconcile_summary: dict[str, Any] | None = None
+    working_after: list[WorkingOrder] | None = None
+    pre_cleanup: dict[str, Any]
+    if persistent_ladder:
+        now_ts = time.time()
+        working_after, reconcile_summary = reconcile_orders(
+            existing_orders=list(existing_working_orders or []),
+            actions=actions,
+            now_ts=now_ts,
+            ttl_seconds=ladder_ttl_seconds,
+            cycle_index=cycle_index,
+            slug=event["slug"],
+        )
+        # Only the actions the reconciler classified as created or
+        # amended get submitted this cycle. Preserved orders stay
+        # live on the book — that's what eliminates the cancel/repost
+        # churn the spec targets.
+        submit_keys = {
+            row["key"] for row in reconcile_summary.get("created", [])
+        } | {
+            row["key"] for row in reconcile_summary.get("amended", [])
+        }
+        actions_to_submit = [
+            action
+            for action in actions
+            if f"{action['outcome']}:{action.get('mode') or ''}:{int(action.get('layer') or 0)}"
+            in submit_keys
+        ]
+        pre_cleanup = {
+            "status": "skipped",
+            "skipReason": "persistent_ladder_enabled",
+            "reconcileCounts": {
+                "created": len(reconcile_summary.get("created", [])),
+                "amended": len(reconcile_summary.get("amended", [])),
+                "preserved": len(reconcile_summary.get("preserved", [])),
+                "cancelled": len(reconcile_summary.get("cancelled", [])),
+            },
+        }
+    else:
+        actions_to_submit = actions
+        pre_cleanup = cleanup_cancel_all(
+            binary=binary,
+            creds=creds,
+            nonce=nonce,
+            private_key=private_key,
+            signature_type=signature_type,
+            funder=funder,
+            config_path=cleanup_plan.config_path,
+            token_id=event["upTokenId"],
+            market_id=event["conditionId"],
+            fee_rate_bps=fee_rate_bps,
+            log_path=output_dir / f"{event['slug']}.{cycle_tag}.pre-cleanup.log",
+        )
 
     submits: list[dict[str, Any]] = []
     inferred_fills: list[FillRecord] = []
-    for action in actions:
+    for action in actions_to_submit:
         outcome = str(action["outcome"])
         mode = str(action.get("mode") or "")
         other_outcome = "Down" if outcome == "Up" else "Up"
@@ -1323,7 +1481,7 @@ def run_cycle_actions(
         elif mode == "maker_paired" and str(parsed.get("status") or "") == "live":
             live_maker_paired_by_outcome[outcome] = True
 
-    return {
+    result = {
         "preCleanup": pre_cleanup,
         "submits": submits,
         "cleanupConfigPath": str(cleanup_plan.config_path),
@@ -1339,6 +1497,17 @@ def run_cycle_actions(
             for fill in inferred_fills
         ],
     }
+    if persistent_ladder and reconcile_summary is not None:
+        # Caller (main loop) keeps the session-level working-orders
+        # list; return the post-reconcile snapshot so it can roll
+        # forward without re-diffing against REST state.
+        result["persistentLadder"] = {
+            "enabled": True,
+            "ttlSeconds": round(float(ladder_ttl_seconds), 6),
+            "reconcile": reconcile_summary,
+            "workingAfter": [order.to_dict() for order in (working_after or [])],
+        }
+    return result
 
 
 def main() -> int:
@@ -1387,6 +1556,11 @@ def main() -> int:
             "makerPairThreshold": args.maker_pair_threshold,
             "makerLayerSizeRatio": args.maker_layer_size_ratio,
             "maxActionsPerCycle": args.max_actions_per_cycle,
+            "persistentLadder": bool(args.persistent_ladder),
+            "ladderTtlSeconds": float(args.ladder_ttl_seconds),
+            "projectedExposureLimitShares": float(
+                args.projected_exposure_limit_shares
+            ),
             "watchSeconds": args.watch_seconds,
             "residualWatchSeconds": args.residual_watch_seconds,
             "pollSeconds": args.poll_seconds,
@@ -1441,6 +1615,10 @@ def main() -> int:
     )
     cycle_index = 0
     last_execution_wall_time: float | None = None
+    # Milestone 1 — session-level working-orders ledger. Populated
+    # only when --persistent-ladder is on; each cycle reconciles the
+    # target ladder against this list instead of cancel-all-per-cycle.
+    session_working_orders: list[WorkingOrder] = []
 
     while time.time() < deadline:
         cycle_index += 1
@@ -1460,6 +1638,10 @@ def main() -> int:
             min_depth_ratio=args.min_depth_ratio,
             min_best_level_ratio=args.min_best_level_ratio,
         )
+        # Outstanding exposure is what decide_actions needs to treat
+        # working orders as real risk. Zeros when persistent-ladder is
+        # off, so default behavior is unchanged.
+        outstanding = compute_outstanding_exposure(session_working_orders)
         decision = decide_actions(
             event=event,
             state=state,
@@ -1486,6 +1668,9 @@ def main() -> int:
             maker_pair_threshold=args.maker_pair_threshold,
             maker_layer_size_ratio=args.maker_layer_size_ratio,
             max_actions_per_cycle=args.max_actions_per_cycle,
+            outstanding_up=outstanding.get("Up", 0.0),
+            outstanding_down=outstanding.get("Down", 0.0),
+            projected_exposure_limit_shares=args.projected_exposure_limit_shares,
         )
 
         pair_quote = quotes.get("pairQuotedCost")
@@ -1528,8 +1713,21 @@ def main() -> int:
                 symbol_prefix=args.symbol_prefix,
                 stamp=stamp,
                 cycle_index=cycle_index,
+                persistent_ladder=args.persistent_ladder,
+                existing_working_orders=session_working_orders,
+                ladder_ttl_seconds=args.ladder_ttl_seconds,
             )
             cycle["execution"] = execution
+            if args.persistent_ladder:
+                # Roll the working-orders ledger forward. When the
+                # flag is on, run_cycle_actions returns the
+                # post-reconcile snapshot; otherwise we keep the list
+                # empty so exposure stays zeroed on the off path.
+                persistent = execution.get("persistentLadder") or {}
+                working_rows = persistent.get("workingAfter") or []
+                session_working_orders = [
+                    WorkingOrder(**row) for row in working_rows
+                ]
             for fill_row in execution.get("inferredFills", []):
                 inferred_fills.append(
                     FillRecord(

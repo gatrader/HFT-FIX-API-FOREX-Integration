@@ -13,7 +13,14 @@ from typing import Any
 
 import requests
 
-from btc5_ladder_manager import WorkingOrder, ladder_summary, prune_expired_orders, reconcile_orders
+from btc5_ladder_manager import (
+    WorkingOrder,
+    compute_outstanding_exposure,
+    ladder_summary,
+    project_residual_if_all_fill,
+    prune_expired_orders,
+    reconcile_orders,
+)
 from btc5_market_feed import RestPollingMarketFeed
 from resolve_next_btc5 import resolve
 from run_replica_btc5_accumulator import (
@@ -114,6 +121,18 @@ def add_strategy_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--maker-pair-threshold", type=float, default=1.02)
     parser.add_argument("--maker-layer-size-ratio", type=float, default=0.5)
     parser.add_argument("--max-actions-per-cycle", type=int, default=6)
+    # Milestone 1 — same flag name as the accumulator so shadow runs
+    # validate the identical check the live path will use.
+    parser.add_argument(
+        "--projected-exposure-limit-shares",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, clip any new shadow target that would push "
+            "projected post-fill residual (filled + all outstanding) "
+            "past this many shares. Mirrors the accumulator knob."
+        ),
+    )
     parser.add_argument("--bid-improve", type=float, default=0.0)
     parser.add_argument("--depth-band", type=float, default=0.02)
     parser.add_argument("--min-depth-ratio", type=float, default=1.5)
@@ -797,6 +816,11 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
         min_depth_ratio=args.min_depth_ratio,
         min_best_level_ratio=args.min_best_level_ratio,
     )
+    # Milestone 1 — mirror the accumulator's exposure-as-risk check.
+    # openOrders is pruned upstream (prune_shadow_orders then
+    # match_shadow_orders) so it already reflects the shadow's belief
+    # about which target orders are still "live" on the book.
+    outstanding_shadow = compute_outstanding_exposure(session["openOrders"])
     decision = decide_actions(
         event=event,
         state=state,
@@ -823,6 +847,24 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
         maker_pair_threshold=args.maker_pair_threshold,
         maker_layer_size_ratio=args.maker_layer_size_ratio,
         max_actions_per_cycle=args.max_actions_per_cycle,
+        outstanding_up=outstanding_shadow.get("Up", 0.0),
+        outstanding_down=outstanding_shadow.get("Down", 0.0),
+        projected_exposure_limit_shares=args.projected_exposure_limit_shares,
+    )
+    # Milestone 1 — cycle-level risk metrics. These match the spec's
+    # "metrics to track" list so parameter sweeps can be scored on
+    # persistence, not just action count.
+    open_orders_now: list[WorkingOrder] = session["openOrders"]
+    working_by_outcome = {"Up": 0, "Down": 0}
+    for order in open_orders_now:
+        working_by_outcome[order.outcome] = (
+            working_by_outcome.get(order.outcome, 0) + 1
+        )
+    projected_side, projected_qty = project_residual_if_all_fill(
+        filled_up=state.up_qty,
+        filled_down=state.down_qty,
+        outstanding_up=outstanding_shadow.get("Up", 0.0),
+        outstanding_down=outstanding_shadow.get("Down", 0.0),
     )
     cycle = {
         "cycle": cycle_index,
@@ -831,6 +873,16 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
         "inventory": state.to_dict(),
         "quotes": quotes,
         "decision": decision,
+        "outstandingExposure": {
+            "Up": round(outstanding_shadow.get("Up", 0.0), 6),
+            "Down": round(outstanding_shadow.get("Down", 0.0), 6),
+        },
+        "workingOrderCountByOutcome": working_by_outcome,
+        "projectedResidual": {
+            "side": projected_side,
+            "qty": round(projected_qty, 6),
+        },
+        "exposureClipCount": len(decision.get("exposureClips") or []),
     }
     warnings = [warning for warning in (reference_warning, market_warning) if warning]
     if warnings:
