@@ -370,6 +370,64 @@ def build_parser() -> argparse.ArgumentParser:
         default="generated",
         help="Directory inside the clean room for configs, logs, and summaries.",
     )
+    # paired_below_par strategy flags (defaults preserve legacy
+    # behavior so existing recordings are unaffected).
+    parser.add_argument(
+        "--strategy-mode",
+        choices=("legacy", "paired_below_par"),
+        default="legacy",
+        help=(
+            "legacy = current residual-first decision tree. "
+            "paired_below_par = prioritize paired entry whenever "
+            "pair_cost < --pair-par-threshold; treat residual as "
+            "repair, not freeze."
+        ),
+    )
+    parser.add_argument(
+        "--pair-par-threshold",
+        type=float,
+        default=1.00,
+        help="Maximum pair_cost (Up + Down) considered profitable.",
+    )
+    parser.add_argument(
+        "--touch-rest-band",
+        type=float,
+        default=0.02,
+        help=(
+            "When pair_cost is above par but within this band, post "
+            "at the venue's current best bid (no improve, no "
+            "aggression) instead of holding."
+        ),
+    )
+    parser.add_argument(
+        "--max-one-sided-shares",
+        type=float,
+        default=None,
+        help=(
+            "Per-side cap on filled+outstanding shares. New legs that "
+            "would push a side above this are clipped (not the whole "
+            "decision)."
+        ),
+    )
+    parser.add_argument(
+        "--hedge-affordability-capital",
+        type=float,
+        default=None,
+        help=(
+            "Maximum notional ($) for any single rebalance/leg "
+            "submission. Stops the engine from posting orders it "
+            "cannot afford to fill. None disables the check."
+        ),
+    )
+    parser.add_argument(
+        "--reopen-cooldown-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "When > 0, skip recreating any ladder key cancelled inside "
+            "this many seconds. Mitigates reopen loops."
+        ),
+    )
     parser.add_argument(
         "--live-ok",
         action="store_true",
@@ -958,6 +1016,14 @@ def decide_actions(
     maker_pair_threshold: float,
     maker_layer_size_ratio: float,
     max_actions_per_cycle: int,
+    strategy_mode: str = "legacy",
+    pair_par_threshold: float = 1.00,
+    touch_rest_band: float = 0.02,
+    max_one_sided_shares: float | None = None,
+    hedge_affordability_capital: float | None = None,
+    recently_cancelled_keys: dict[str, float] | None = None,
+    reopen_cooldown_seconds: float = 0.0,
+    now_ts: float | None = None,
 ) -> dict[str, Any]:
     remaining = seconds_left(event)
     decisions: list[dict[str, Any]] = []
@@ -1112,119 +1178,328 @@ def decide_actions(
     maker_base_down = anchor_pair_context["downQuote"] if anchor_pair_context else down_quote
     maker_layers_effective = 1 if anchor_pair_actions else maker_layers
 
-    if residual_qty >= max_residual_shares:
-        if can_rebalance:
-            decisions.append(
-                {
-                    "outcome": lagging_side,
-                    "quotedPrice": lagging_quote,
-                    "size": rebalance_size,
-                    "mode": "rebalance",
-                    "projectedPairCost": rebalance_cost,
-                }
-            )
-            reason = "rebalance_lagging_side"
-        elif maker_rebalance_actions:
-            decisions.extend(maker_rebalance_actions[:effective_max_actions])
-            reason = "maker_rebalance_ladder"
-        else:
-            reason = "residual_cap_reached"
-    else:
-        if can_rebalance:
-            decisions.append(
-                {
-                    "outcome": lagging_side,
-                    "quotedPrice": lagging_quote,
-                    "size": rebalance_size,
-                    "mode": "rebalance",
-                    "projectedPairCost": rebalance_cost,
-                }
-            )
-            reason = "rebalance_lagging_side"
-        elif maker_rebalance_actions:
-            decisions.extend(maker_rebalance_actions[:effective_max_actions])
-            reason = "maker_rebalance_ladder"
+    # ── paired_below_par strategy ────────────────────────────────────
+    # Hypothesis: the reference wallet is not predicting direction; it
+    # is buying the binary package at price(Up)+price(Down) < 1.00 and
+    # realizing through redeem. Therefore the engine should prioritize
+    # paired entry whenever pair_cost < pair_par_threshold, NOT only
+    # when a thin direct-edge gate (entry_threshold) is satisfied.
+    #
+    # Decisions inside this branch are still subject to the existing
+    # max_residual_shares / projected-exposure / late-session guards,
+    # but residual is now treated as a clip on the hot side rather
+    # than a global freeze.
+    #
+    # Reason codes the measurement report can score:
+    #   paired_below_par_active           — full-paired below par
+    #   paired_below_par_touch_rest       — at-touch posting in
+    #                                       [par-band, par)
+    #   paired_below_par_one_sided_clip   — Up-leg or Down-leg blocked
+    #                                       to avoid widening residual
+    #   paired_below_par_reopen_cooldown  — key was just cancelled,
+    #                                       skip recreate this cycle
+    #   paired_below_par_hedge_affordability_block
+    #   paired_below_par_blocked_residual — residual fully blocking
+    #                                       entry (rebalance-only)
+    #   paired_below_par_above_par        — pair_cost ≥ par + band
+    cancelled_recently: set[str] = set()
+    cooldown_evidence: list[dict[str, Any]] = []
+    if recently_cancelled_keys and reopen_cooldown_seconds > 0 and now_ts is not None:
+        for key, last_cancel_ts in recently_cancelled_keys.items():
+            if now_ts - float(last_cancel_ts) < reopen_cooldown_seconds:
+                cancelled_recently.add(str(key))
+
+    def _filter_reopen(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop actions whose ladder key was cancelled inside the cooldown."""
+        if not cancelled_recently:
+            return actions
+        kept: list[dict[str, Any]] = []
+        for a in actions:
+            key = f"{a['outcome']}:{a.get('mode') or ''}:{int(a.get('layer') or 0)}"
+            if key in cancelled_recently:
+                cooldown_evidence.append(
+                    {
+                        "key": key,
+                        "reason": "paired_below_par_reopen_cooldown",
+                    }
+                )
+                continue
+            kept.append(a)
+        return kept
+
+    def _hedge_affordable(action: dict[str, Any]) -> bool:
+        """Stop placing rebalance/legged orders we cannot afford to fill."""
+        if hedge_affordability_capital is None:
+            return True
+        notional = float(action.get("size", 0.0)) * float(action.get("quotedPrice", 0.0))
+        return notional <= float(hedge_affordability_capital) + 1e-9
+
+    one_sided_clips: list[dict[str, Any]] = []
+    hedge_blocks: list[dict[str, Any]] = []
+    paired_below_par_block_reason: str | None = None
+
+    if strategy_mode == "paired_below_par" and pair_cost is not None and pair_clip_ok:
+        # Outstanding-aware projected per-side exposure. The engine
+        # treats outstanding as risk: if Up is already heavy, posting
+        # another Up clip is one-sided accumulation — clip just that
+        # leg, keep the Down leg.
+        proj_up = state.up_qty + outstanding_up
+        proj_down = state.down_qty + outstanding_down
+        pair_under_par = pair_cost <= pair_par_threshold + 1e-9
+        pair_in_touch_rest = (
+            not pair_under_par
+            and pair_cost <= pair_par_threshold + max(0.0, touch_rest_band) + 1e-9
+        )
+
+        if not enough_depth:
+            paired_below_par_block_reason = "insufficient_bid_depth_within_band"
         elif late_session_residual_guard:
-            reason = "late_session_residual_guard"
+            paired_below_par_block_reason = "late_session_residual_guard"
         elif session_paired_blocked:
-            reason = "session_inventory_guard"
-        elif (
-            pair_cost is not None
-            and pair_cost <= entry_threshold
-            and enough_depth
-            and enough_best_level
-            and pair_clip_ok
-            and pair_clip_size <= available_pair_budget + 1e-9
-        ):
-            decisions.extend(
-                [
-                    {
-                        "outcome": "Up",
-                        "quotedPrice": up_quote,
-                        "size": pair_clip_size,
-                        "mode": "paired",
-                    },
-                    {
-                        "outcome": "Down",
-                        "quotedPrice": down_quote,
-                        "size": pair_clip_size,
-                        "mode": "paired",
-                    },
-                ]
+            paired_below_par_block_reason = "session_inventory_guard"
+        elif pair_under_par or pair_in_touch_rest:
+            # Touch-rest mode posts at the venue's current best bid
+            # (no improve, no aggression). Below-par posts at the
+            # planner's improved quote. Same shape, different price.
+            base_up = up_quote
+            base_down = down_quote
+            if pair_in_touch_rest:
+                touch_up = quotes.get("up")
+                touch_down = quotes.get("down")
+                if touch_up is not None:
+                    base_up = round(float(touch_up.get("price", up_quote)), 6)
+                if touch_down is not None:
+                    base_down = round(float(touch_down.get("price", down_quote)), 6)
+
+            candidates = [
+                {
+                    "outcome": "Up",
+                    "quotedPrice": base_up,
+                    "size": pair_clip_size,
+                    "mode": "paired_below_par" if pair_under_par else "paired_touch_rest",
+                    "layer": 0,
+                    "projectedPairCost": round(base_up + base_down, 6),
+                },
+                {
+                    "outcome": "Down",
+                    "quotedPrice": base_down,
+                    "size": pair_clip_size,
+                    "mode": "paired_below_par" if pair_under_par else "paired_touch_rest",
+                    "layer": 0,
+                    "projectedPairCost": round(base_up + base_down, 6),
+                },
+            ]
+
+            # Residual-as-repair, not residual-as-freeze: when residual
+            # is already past the cap, allow only the leg that pairs
+            # off the existing imbalance. We do NOT bail out; we clip.
+            if residual_qty > max_residual_shares:
+                heavy = residual_side  # "Up" or "Down"
+                kept_candidates: list[dict[str, Any]] = []
+                for cand in candidates:
+                    if cand["outcome"] == heavy:
+                        one_sided_clips.append(
+                            {
+                                "outcome": cand["outcome"],
+                                "size": cand["size"],
+                                "mode": cand["mode"],
+                                "reason": "residual_repair_clip",
+                                "residualSide": heavy,
+                                "residualQty": round(residual_qty, 6),
+                            }
+                        )
+                        continue
+                    kept_candidates.append(cand)
+                candidates = kept_candidates
+
+            # Outstanding-skew clip: stop adding to whichever side is
+            # already over the per-side cap.
+            if max_one_sided_shares is not None:
+                kept_candidates = []
+                for cand in candidates:
+                    side = cand["outcome"]
+                    side_after = (
+                        proj_up + (cand["size"] if side == "Up" else 0.0)
+                        if side == "Up"
+                        else proj_down + (cand["size"] if side == "Down" else 0.0)
+                    )
+                    if side_after > max_one_sided_shares + 1e-9:
+                        one_sided_clips.append(
+                            {
+                                "outcome": side,
+                                "size": cand["size"],
+                                "mode": cand["mode"],
+                                "reason": "one_sided_exposure_clip",
+                                "projectedSide": round(side_after, 6),
+                                "limit": round(max_one_sided_shares, 6),
+                            }
+                        )
+                        continue
+                    kept_candidates.append(cand)
+                candidates = kept_candidates
+
+            # Hedge-affordability gate (notional check on each leg).
+            kept_candidates = []
+            for cand in candidates:
+                if _hedge_affordable(cand):
+                    kept_candidates.append(cand)
+                else:
+                    hedge_blocks.append(
+                        {
+                            "outcome": cand["outcome"],
+                            "size": cand["size"],
+                            "price": cand["quotedPrice"],
+                            "reason": "hedge_affordability_block",
+                        }
+                    )
+            candidates = kept_candidates
+
+            # Reopen-loop cooldown: if we just cancelled this key,
+            # skip recreate this cycle.
+            candidates = _filter_reopen(candidates)
+
+            # Discriminate residual-repair clips from one-sided-cap
+            # clips so the top-level reason can be precise. Both end
+            # up in `one_sided_clips` for measurement, but the cause
+            # is different and should map to a different reason code.
+            had_residual_repair_clip = any(
+                c.get("reason") == "residual_repair_clip"
+                for c in one_sided_clips
             )
-            remaining_slots = max(0, effective_max_actions - len(decisions))
-            anchor_actions_for_pair = anchor_pair_actions[:remaining_slots]
-            if anchor_actions_for_pair:
-                decisions.extend(anchor_actions_for_pair)
-            maker_pair_actions = cap_actions_by_outcome_budget(
-                build_maker_paired_layers(
-                    up_base=maker_base_up,
-                    down_base=maker_base_down,
-                    clip_shares=clip_shares,
-                    min_order_notional=min_order_notional,
-                    max_clip_shares=max_clip_shares,
-                    maker_layers=maker_layers_effective,
-                    maker_price_step=maker_price_step,
-                    maker_pair_threshold=maker_pair_threshold,
-                    maker_layer_size_ratio=maker_layer_size_ratio,
-                    remaining_action_slots=max(0, effective_max_actions - len(decisions)),
-                    include_base_layer=False,
-                ),
-                per_outcome_budget=max(
-                    0.0,
-                    available_pair_budget
-                    - pair_clip_size
-                    - (pair_clip_size if anchor_actions_for_pair else 0.0),
-                ),
+            had_one_sided_cap_clip = any(
+                c.get("reason") == "one_sided_exposure_clip"
+                for c in one_sided_clips
             )
-            if maker_pair_actions:
-                decisions.extend(maker_pair_actions)
-                reason = "hybrid_paired_anchor_maker" if anchor_actions_for_pair else "hybrid_paired_maker"
-            elif anchor_actions_for_pair:
-                reason = "reference_like_anchor_pair"
+            if candidates:
+                decisions.extend(candidates[: max(0, effective_max_actions)])
+                if pair_under_par:
+                    reason = "paired_below_par_active"
+                else:
+                    reason = "paired_below_par_touch_rest"
+                if had_residual_repair_clip:
+                    reason = f"{reason}_with_residual_repair"
+                elif had_one_sided_cap_clip:
+                    reason = f"{reason}_with_one_sided_clip"
+            elif hedge_blocks and not candidates:
+                reason = "paired_below_par_hedge_affordability_block"
+            elif cooldown_evidence and not candidates:
+                reason = "paired_below_par_reopen_cooldown"
+            elif had_one_sided_cap_clip:
+                reason = "paired_below_par_one_sided_block"
+            elif had_residual_repair_clip:
+                reason = "paired_below_par_blocked_residual"
+            # else: fall through to the legacy decision tree below.
+        else:
+            paired_below_par_block_reason = "paired_below_par_above_par"
+
+        # If we generated decisions, we still want the rebalance leg
+        # to fire alongside (residual repair as side-effect, not
+        # primary). Append rebalance once if pending.
+        if decisions and can_rebalance and _hedge_affordable({
+            "size": rebalance_size,
+            "quotedPrice": lagging_quote,
+        }):
+            decisions.append(
+                {
+                    "outcome": lagging_side,
+                    "quotedPrice": lagging_quote,
+                    "size": rebalance_size,
+                    "mode": "rebalance",
+                    "projectedPairCost": rebalance_cost,
+                }
+            )
+
+    if not decisions and strategy_mode == "paired_below_par":
+        # Strategy ran but produced no actions; record the reason for
+        # measurement reporting before falling through.
+        if paired_below_par_block_reason and reason == "hold":
+            reason = paired_below_par_block_reason
+
+    # When the new strategy fired an anti-pattern guard
+    # (one-sided exposure / hedge affordability / reopen cooldown),
+    # we must NOT fall through to the permissive legacy tree — that
+    # would re-emit exactly the action the guard just blocked. Setting
+    # an explicit reason here makes the block visible to scoring.
+    paired_below_par_guard_fired = (
+        strategy_mode == "paired_below_par"
+        and not decisions
+        and bool(one_sided_clips or hedge_blocks or cooldown_evidence)
+    )
+    if paired_below_par_guard_fired and reason == "hold":
+        if hedge_blocks:
+            reason = "paired_below_par_hedge_affordability_block"
+        elif cooldown_evidence:
+            reason = "paired_below_par_reopen_cooldown"
+        else:
+            reason = "paired_below_par_one_sided_block"
+
+    if not decisions and not paired_below_par_guard_fired:
+        if residual_qty >= max_residual_shares:
+            if can_rebalance:
+                decisions.append(
+                    {
+                        "outcome": lagging_side,
+                        "quotedPrice": lagging_quote,
+                        "size": rebalance_size,
+                        "mode": "rebalance",
+                        "projectedPairCost": rebalance_cost,
+                    }
+                )
+                reason = "rebalance_lagging_side"
+            elif maker_rebalance_actions:
+                decisions.extend(maker_rebalance_actions[:effective_max_actions])
+                reason = "maker_rebalance_ladder"
             else:
-                reason = "paired_bid_edge"
-        elif (
-            pair_cost is not None
-            and enough_depth
-            and build_maker_paired_layers(
-                up_base=maker_base_up,
-                down_base=maker_base_down,
-                clip_shares=clip_shares,
-                min_order_notional=min_order_notional,
-                max_clip_shares=max_clip_shares,
-                maker_layers=maker_layers_effective,
-                maker_price_step=maker_price_step,
-                maker_pair_threshold=maker_pair_threshold,
-                maker_layer_size_ratio=maker_layer_size_ratio,
-                remaining_action_slots=effective_max_actions,
-                include_base_layer=not anchor_pair_actions,
-            )
-        ):
-            decisions.extend(
-                cap_actions_by_outcome_budget(
-                    anchor_pair_actions
-                    + build_maker_paired_layers(
+                reason = "residual_cap_reached"
+        else:
+            if can_rebalance:
+                decisions.append(
+                    {
+                        "outcome": lagging_side,
+                        "quotedPrice": lagging_quote,
+                        "size": rebalance_size,
+                        "mode": "rebalance",
+                        "projectedPairCost": rebalance_cost,
+                    }
+                )
+                reason = "rebalance_lagging_side"
+            elif maker_rebalance_actions:
+                decisions.extend(maker_rebalance_actions[:effective_max_actions])
+                reason = "maker_rebalance_ladder"
+            elif late_session_residual_guard:
+                reason = "late_session_residual_guard"
+            elif session_paired_blocked:
+                reason = "session_inventory_guard"
+            elif (
+                pair_cost is not None
+                and pair_cost <= entry_threshold
+                and enough_depth
+                and enough_best_level
+                and pair_clip_ok
+                and pair_clip_size <= available_pair_budget + 1e-9
+            ):
+                decisions.extend(
+                    [
+                        {
+                            "outcome": "Up",
+                            "quotedPrice": up_quote,
+                            "size": pair_clip_size,
+                            "mode": "paired",
+                        },
+                        {
+                            "outcome": "Down",
+                            "quotedPrice": down_quote,
+                            "size": pair_clip_size,
+                            "mode": "paired",
+                        },
+                    ]
+                )
+                remaining_slots = max(0, effective_max_actions - len(decisions))
+                anchor_actions_for_pair = anchor_pair_actions[:remaining_slots]
+                if anchor_actions_for_pair:
+                    decisions.extend(anchor_actions_for_pair)
+                maker_pair_actions = cap_actions_by_outcome_budget(
+                    build_maker_paired_layers(
                         up_base=maker_base_up,
                         down_base=maker_base_down,
                         clip_shares=clip_shares,
@@ -1234,27 +1509,74 @@ def decide_actions(
                         maker_price_step=maker_price_step,
                         maker_pair_threshold=maker_pair_threshold,
                         maker_layer_size_ratio=maker_layer_size_ratio,
-                        remaining_action_slots=effective_max_actions,
-                        include_base_layer=not anchor_pair_actions,
+                        remaining_action_slots=max(0, effective_max_actions - len(decisions)),
+                        include_base_layer=False,
                     ),
-                    per_outcome_budget=available_pair_budget,
+                    per_outcome_budget=max(
+                        0.0,
+                        available_pair_budget
+                        - pair_clip_size
+                        - (pair_clip_size if anchor_actions_for_pair else 0.0),
+                    ),
                 )
-            )
-            reason = (
-                "reference_like_maker_ladder"
-                if decisions
-                else "session_pair_budget_exhausted"
-            )
-        elif pair_cost is not None and pair_cost <= entry_threshold and not pair_clip_ok:
-            reason = "min_notional_requires_too_many_shares"
-        elif pair_cost is not None and pair_cost <= entry_threshold and pair_clip_size is not None and pair_clip_size > available_pair_budget:
-            reason = "session_pair_budget_exhausted"
-        elif not enough_best_level:
-            reason = "thin_top_of_book_bid"
-        elif not enough_depth:
-            reason = "insufficient_bid_depth_within_band"
-        elif pair_cost is not None and pair_cost > entry_threshold:
-            reason = "no_bid_edge_after_threshold"
+                if maker_pair_actions:
+                    decisions.extend(maker_pair_actions)
+                    reason = "hybrid_paired_anchor_maker" if anchor_actions_for_pair else "hybrid_paired_maker"
+                elif anchor_actions_for_pair:
+                    reason = "reference_like_anchor_pair"
+                else:
+                    reason = "paired_bid_edge"
+            elif (
+                pair_cost is not None
+                and enough_depth
+                and build_maker_paired_layers(
+                    up_base=maker_base_up,
+                    down_base=maker_base_down,
+                    clip_shares=clip_shares,
+                    min_order_notional=min_order_notional,
+                    max_clip_shares=max_clip_shares,
+                    maker_layers=maker_layers_effective,
+                    maker_price_step=maker_price_step,
+                    maker_pair_threshold=maker_pair_threshold,
+                    maker_layer_size_ratio=maker_layer_size_ratio,
+                    remaining_action_slots=effective_max_actions,
+                    include_base_layer=not anchor_pair_actions,
+                )
+            ):
+                decisions.extend(
+                    cap_actions_by_outcome_budget(
+                        anchor_pair_actions
+                        + build_maker_paired_layers(
+                            up_base=maker_base_up,
+                            down_base=maker_base_down,
+                            clip_shares=clip_shares,
+                            min_order_notional=min_order_notional,
+                            max_clip_shares=max_clip_shares,
+                            maker_layers=maker_layers_effective,
+                            maker_price_step=maker_price_step,
+                            maker_pair_threshold=maker_pair_threshold,
+                            maker_layer_size_ratio=maker_layer_size_ratio,
+                            remaining_action_slots=effective_max_actions,
+                            include_base_layer=not anchor_pair_actions,
+                        ),
+                        per_outcome_budget=available_pair_budget,
+                    )
+                )
+                reason = (
+                    "reference_like_maker_ladder"
+                    if decisions
+                    else "session_pair_budget_exhausted"
+                )
+            elif pair_cost is not None and pair_cost <= entry_threshold and not pair_clip_ok:
+                reason = "min_notional_requires_too_many_shares"
+            elif pair_cost is not None and pair_cost <= entry_threshold and pair_clip_size is not None and pair_clip_size > available_pair_budget:
+                reason = "session_pair_budget_exhausted"
+            elif not enough_best_level:
+                reason = "thin_top_of_book_bid"
+            elif not enough_depth:
+                reason = "insufficient_bid_depth_within_band"
+            elif pair_cost is not None and pair_cost > entry_threshold:
+                reason = "no_bid_edge_after_threshold"
 
     return {
         "secondsLeft": remaining,
@@ -1657,6 +1979,10 @@ def main() -> int:
     last_execution_wall_time: float | None = None
     session_open_orders: list[WorkingOrder] = []
     seen_fill_hashes: set[str] = set()
+    # paired_below_par strategy — keep a per-key wall-clock timestamp
+    # of the last time a key was cancelled, so reopen-loop cooldown
+    # can suppress immediate recreation. Empty for legacy mode.
+    session_recent_cancels: dict[str, float] = {}
     session_order_ttl = max(
         15.0,
         args.poll_seconds * 6.0,
@@ -1737,6 +2063,14 @@ def main() -> int:
             maker_pair_threshold=args.maker_pair_threshold,
             maker_layer_size_ratio=args.maker_layer_size_ratio,
             max_actions_per_cycle=args.max_actions_per_cycle,
+            strategy_mode=args.strategy_mode,
+            pair_par_threshold=args.pair_par_threshold,
+            touch_rest_band=args.touch_rest_band,
+            max_one_sided_shares=args.max_one_sided_shares,
+            hedge_affordability_capital=args.hedge_affordability_capital,
+            recently_cancelled_keys=session_recent_cancels,
+            reopen_cooldown_seconds=args.reopen_cooldown_seconds,
+            now_ts=time.time(),
         )
 
         pair_quote = quotes.get("pairQuotedCost")

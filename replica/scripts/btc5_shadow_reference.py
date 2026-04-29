@@ -115,6 +115,23 @@ def add_strategy_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--maker-pair-threshold", type=float, default=1.02)
     parser.add_argument("--maker-layer-size-ratio", type=float, default=0.5)
     parser.add_argument("--max-actions-per-cycle", type=int, default=6)
+    # paired_below_par strategy flags — see decide_actions docstring
+    # in run_replica_btc5_accumulator.py. Defaults preserve legacy
+    # behavior so historical recordings remain comparable.
+    parser.add_argument(
+        "--strategy-mode",
+        choices=("legacy", "paired_below_par"),
+        default="legacy",
+    )
+    parser.add_argument("--pair-par-threshold", type=float, default=1.00)
+    parser.add_argument("--touch-rest-band", type=float, default=0.02)
+    parser.add_argument("--max-one-sided-shares", type=float, default=None)
+    parser.add_argument(
+        "--hedge-affordability-capital", type=float, default=None
+    )
+    parser.add_argument(
+        "--reopen-cooldown-seconds", type=float, default=0.0
+    )
     parser.add_argument("--bid-improve", type=float, default=0.0)
     parser.add_argument("--depth-band", type=float, default=0.02)
     parser.add_argument("--min-depth-ratio", type=float, default=1.5)
@@ -852,6 +869,18 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
         maker_pair_threshold=args.maker_pair_threshold,
         maker_layer_size_ratio=args.maker_layer_size_ratio,
         max_actions_per_cycle=args.max_actions_per_cycle,
+        strategy_mode=getattr(args, "strategy_mode", "legacy"),
+        pair_par_threshold=getattr(args, "pair_par_threshold", 1.00),
+        touch_rest_band=getattr(args, "touch_rest_band", 0.02),
+        max_one_sided_shares=getattr(args, "max_one_sided_shares", None),
+        hedge_affordability_capital=getattr(
+            args, "hedge_affordability_capital", None
+        ),
+        recently_cancelled_keys=session.setdefault("recentCancels", {}),
+        reopen_cooldown_seconds=getattr(
+            args, "reopen_cooldown_seconds", 0.0
+        ),
+        now_ts=time.time(),
     )
     cycle = {
         "cycle": cycle_index,
@@ -891,6 +920,20 @@ def step_shadow_session(session: dict[str, Any], args: argparse.Namespace, cycle
         cycle["targetLadder"] = ladder_summary(decision["actions"])
         cycle["ladderReconcile"] = reconcile_summary
         cycle["openOrdersAfterReconcile"] = [row.to_dict() for row in session["openOrders"]]
+        # Record cancellation timestamps so the next cycle's
+        # reopen-cooldown guard inside decide_actions can suppress
+        # immediate recreation of just-cancelled keys.
+        recent_cancels = session.setdefault("recentCancels", {})
+        for c in reconcile_summary.get("cancelled") or []:
+            key = c.get("key") or f"{c.get('outcome','')}:{c.get('mode','')}:{int(c.get('layer') or 0)}"
+            if key:
+                recent_cancels[key] = placed_at
+        # Trim ancient entries — anything older than 5 minutes is
+        # well past any reopen-cooldown window we'd ever set.
+        cutoff = placed_at - 300.0
+        for key, ts in list(recent_cancels.items()):
+            if ts < cutoff:
+                del recent_cancels[key]
         cycle["sessionRiskAfterDecision"] = session_risk_context(
             state=state,
             working_orders=session["openOrders"],
